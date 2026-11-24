@@ -152,7 +152,36 @@ pub(crate) fn wanted(n: u64) -> bool {
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world || timed(n))
+}
+
+/// `VICTORY_CAPTURE_EVERY_SECS=<s>`: also the first frame presented after
+/// every `s` seconds of wall time (frame numbers drift with the frame rate,
+/// so a timeline by frame number does not land on the same moments).
+fn timed(n: u64) -> bool {
+    static EVERY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    let Some(every) = *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_CAPTURE_EVERY_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|s| *s > 0.0)
+            .map(std::time::Duration::from_secs_f64)
+    }) else {
+        return false;
+    };
+    // The frame last taken and when: asked again for the same frame (the
+    // present asks more than once), the answer stays the same.
+    static LAST: std::sync::Mutex<Option<(u64, std::time::Instant)>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    match *last {
+        Some((frame, _)) if frame == n => true,
+        Some((_, at)) if now.duration_since(at) < every => false,
+        _ => {
+            *last = Some((n, now));
+            true
+        }
+    }
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
