@@ -2087,6 +2087,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
             let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
+            // An empty title buffer: nothing to view, and no host copy to
+            // look for (#70: such views were in flight at device removals).
+            if len == 0 {
+                return None;
+            }
             if *unordered {
                 buffer_uav(address, len, uav_desc(words), at)
             } else {
