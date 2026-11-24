@@ -73,13 +73,18 @@ struct Last {
 
 impl Last {
     /// Takes `hash` as the hash of the texture's memory; true when it
-    /// differs from the last one, and then the frame is noted.
+    /// differs from the last one. The frame is noted only when there was a
+    /// last one: a texture's first hash is not a change, so a texture just
+    /// read takes turns as before until a hash finds it changed (a static
+    /// one is not hashed at every check for its first frames).
     fn rehash(&mut self, hash: blake3::Hash) -> bool {
         if self.hash == Some(hash) {
             return false;
         }
+        if self.hash.is_some() {
+            self.changed = Some(crate::frame::current());
+        }
         self.hash = Some(hash);
-        self.changed = Some(crate::frame::current());
         true
     }
 }
@@ -1090,7 +1095,22 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 
 #[cfg(test)]
 mod guard_tests {
-    use super::{HASH_EVERY, RECENTLY_CHANGED, guard_skips};
+    use super::{HASH_EVERY, Last, RECENTLY_CHANGED, guard_skips};
+
+    /// A texture's first hash is not a change: only a hash that differs
+    /// from an earlier one notes the frame that starts hashing at every
+    /// check, so a static texture just read keeps the guard's cadence.
+    #[test]
+    fn only_a_second_differing_hash_is_a_change() {
+        let (a, b) = (blake3::hash(b"a"), blake3::hash(b"b"));
+        let mut last = Last::default();
+        assert!(last.rehash(a), "a first hash is new contents to detile");
+        assert_eq!(last.changed, None);
+        assert!(!last.rehash(a));
+        assert_eq!(last.changed, None);
+        assert!(last.rehash(b));
+        assert!(last.changed.is_some());
+    }
 
     /// Of `frames`, the ones a guarded texture at `start` is hashed in.
     fn hashed(
