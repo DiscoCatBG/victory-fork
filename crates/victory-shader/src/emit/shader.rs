@@ -111,6 +111,7 @@ pub(crate) mod flags {
     /// `[earlydepthstencil]` (`ForceEarlyDepthStencil`): depth and stencil
     /// are tested before the program runs. It has no feature bit.
     pub const EARLY_DEPTH: u64 = 1 << 3;
+    pub const NO_REFACTORING: u64 = 1 << 1;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
@@ -200,6 +201,8 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Every UAV the shader opens is rasterizer ordered ([`Self::annotate`]).
     pub rov: bool,
+    /// A fused multiply-add (`FMad`) was emitted: the driver may then fuse.
+    pub fused: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
     /// Resource properties of each heap handle made, in creation order.
@@ -263,6 +266,7 @@ impl Shader {
             root_uavs: Vec::new(),
             flags: 0,
             rov: false,
+            fused: false,
             nonuniform_handles: 0,
             #[cfg(test)]
             heap_props: Vec::new(),
@@ -804,6 +808,11 @@ impl Shader {
         // A pixel shader with an SV_StencilRef output (as DXC collects it).
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
+        }
+        // Refactoring lets the host fuse a multiply and an add the console
+        // rounds apart (NVIDIA does); only `FMad` needs it, to fuse at all.
+        if !self.fused {
+            self.flags |= flags::NO_REFACTORING;
         }
         // Entry properties: shader flags (tag 0), geometry state (1),
         // thread-group size (4), wave size (11).

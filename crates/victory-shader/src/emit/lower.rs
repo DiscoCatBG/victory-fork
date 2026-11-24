@@ -3787,6 +3787,7 @@ impl<'a> Lower<'a> {
     }
 
     fn fmad(&mut self, a: V, b: V, c: V) -> V {
+        self.s.fused = true;
         self.s.op(
             self.cur,
             "tertiary.f32",
