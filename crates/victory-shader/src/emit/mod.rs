@@ -93,6 +93,9 @@ mod own_bits;
 mod rect;
 mod sampler;
 mod shader;
+mod sig_interp;
+#[cfg(test)]
+mod sig_tests;
 mod threading;
 #[cfg(windows)]
 pub mod validator;
@@ -711,6 +714,17 @@ fn emit_program(
             e.interp = 5;
         }
     }
+    // The modes the title's compiler declared (its `PSV0`) come first:
+    // elements packed into one row must agree, and it made them agree.
+    let conservative_depth = pixel && outputs.iter().any(|e| matches!(e.kind, 18 | 19));
+    let interpolated = if pixel { &mut inputs } else { &mut outputs };
+    if let Some(modes) = c
+        .part(FourCC::PSV0)
+        .and_then(|p| sig_interp::psv_interp(p.data, pixel))
+    {
+        sig_interp::apply_psv_interp(interpolated, &modes, conservative_depth);
+    }
+    sig_interp::harmonize_row_interp(interpolated);
     // Per-primitive outputs are constant. The console never exports a
     // primitive id or cull flag a mesh shader writes (it culls with the
     // primitive export), so those rows are left out.
