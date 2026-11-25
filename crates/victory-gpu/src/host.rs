@@ -4048,13 +4048,14 @@ fn read_backs(list: &HostList) {
                 let from = data.cast::<u8>().cast_const();
                 let src_pitch = row.next_multiple_of(256);
                 let span = (rows - 1).saturating_mul(*pitch).saturating_add(*row);
-                crate::watch::writing(*at, span);
+                let write = TitleWrite::open(*at, span);
                 for line in 0..*rows {
                     let Some(dst) = line.checked_mul(*pitch).and_then(|off| at.checked_add(off)) else {
                         break;
                     };
-                    write_mapped(dst as *mut u8, from.add(line * src_pitch), *row);
+                    write.put(dst, from.add(line * src_pitch), *row);
                 }
+                drop(write);
                 // The walls trace: what the title is handed (one row of at
                 // most 24 values: its 5x1 and 1x1 float targets).
                 if walls_trace() && *rows == 1 && *row <= 96 {
@@ -7944,6 +7945,56 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
             });
         }
         at = to;
+    }
+}
+
+/// Our own write of title memory `[at, at + len)` (what shaders wrote, put
+/// back): through a view of our own of the same memory when the guards hold
+/// all of it read-only ([`crate::watch::aside`]), so the title's views stay
+/// read-only and nothing is opened and guarded again; else the guards are
+/// opened ([`crate::watch::writing`]) and the bytes go in by
+/// [`write_mapped`], as before. The blocks are noted written when it drops,
+/// after the bytes are in. In the run of main 7e88d16 about 1,000 of the
+/// 1,500 blocks opened a frame were opened for our own writes, each a
+/// `VirtualProtect` there and another at the next asking.
+pub(crate) struct TitleWrite {
+    at: usize,
+    len: usize,
+    aside: Option<*mut u8>,
+}
+
+impl TitleWrite {
+    pub(crate) fn open(at: usize, len: usize) -> Self {
+        let aside = crate::watch::aside(at, len);
+        if aside.is_none() {
+            crate::watch::writing(at, len);
+        }
+        TitleWrite { at, len, aside }
+    }
+
+    /// Writes `n` bytes from `src` at title address `dst`, which lies in the
+    /// range opened (a write outside it opens its own).
+    pub(crate) fn put(&self, dst: usize, src: *const u8, n: usize) {
+        match self.aside {
+            Some(base) if dst >= self.at && dst.saturating_add(n) <= self.at + self.len => {
+                // SAFETY: our own view of the range's memory, all of it
+                // committed (`watch::aside`); `src` holds `n` bytes of ours.
+                unsafe { std::ptr::copy_nonoverlapping(src, base.add(dst - self.at), n) };
+            }
+            Some(_) => {
+                crate::watch::writing(dst, n);
+                write_mapped(dst as *mut u8, src, n);
+            }
+            None => write_mapped(dst as *mut u8, src, n),
+        }
+    }
+}
+
+impl Drop for TitleWrite {
+    fn drop(&mut self) {
+        if self.aside.is_some() {
+            crate::watch::wrote_aside(self.at, self.len);
+        }
     }
 }
 

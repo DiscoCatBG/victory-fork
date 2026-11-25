@@ -1015,7 +1015,6 @@ fn write_aside() -> bool {
 /// the next asking, these blocks were two thirds of the blocks the guards
 /// opened in the run of main 7e88d16 (1,500 opened a frame, 420 of them
 /// for the title's own writes).
-#[allow(dead_code)] // until the writes back call it (host.rs, shadow.rs)
 pub(crate) fn aside(at: usize, len: usize) -> Option<*mut u8> {
     if len == 0 || !write_aside() {
         return None;
@@ -1030,7 +1029,6 @@ pub(crate) fn aside(at: usize, len: usize) -> Option<*mut u8> {
 /// After our own write of `[at, at + len)` through [`aside`]: its blocks,
 /// and the other views of their pages, are noted written (they stay
 /// read-only), as [`writing`] would have left them.
-#[allow(dead_code)] // until the writes back call it (host.rs, shadow.rs)
 pub(crate) fn wrote_aside(at: usize, len: usize) {
     {
         let mut g = guards();

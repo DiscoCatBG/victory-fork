@@ -2760,12 +2760,12 @@ impl Shadow {
                     continue;
                 };
                 let at = at + first;
-                crate::watch::writing(start + at, n);
+                let write = crate::host::TitleWrite::open(start + at, n);
                 // Only the GPU's bytes (upstream #2009): the rest of the
                 // stretch is the title's as read, and a title write landing
                 // there since stays.
                 for &(off, len) in &runs {
-                    crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
+                    write.put(start + at + off, title[off..].as_ptr(), len);
                     written += len;
                 }
             }
@@ -2853,8 +2853,7 @@ impl Shadow {
         if !merge_piece(now, held, title) {
             return 0;
         }
-        crate::watch::writing(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        crate::host::TitleWrite::open(start + at, n).put(start + at, title.as_ptr(), n);
         n
     }
 
@@ -3471,8 +3470,7 @@ impl Shadow {
             let (write_title, write_card) = merged_destinations(old, gpu, title);
             upload = write_card;
             if write_title {
-                crate::watch::writing(start + at, n);
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                crate::host::TitleWrite::open(start + at, n).put(start + at, title.as_ptr(), n);
                 written = n;
             }
         } else {
@@ -3599,18 +3597,17 @@ impl Shadow {
         if !mapped || !changed.contains(&true) {
             return 0;
         }
-        // The guards over these bytes are opened once for the run; the
+        // The guards over these bytes are opened once for the run (or the
+        // run is written through a view of our own, `TitleWrite`); the
         // writes below are our own and do not fault into the handler.
-        crate::watch::writing(start + at, n);
+        let write = crate::host::TitleWrite::open(start + at, n);
         // Written in the differing stretches of the parts that changed,
         // ones that touch as one write: the bytes a part by itself would
         // have written, and no more.
         let put = |from: usize, to: usize| {
             let n = to + 1 - from;
-            // SAFETY (the pointer): title memory this copy's bytes map,
-            // which `writing` has opened; `title` holds the run's stretch
-            // from offset `first`.
-            crate::host::write_mapped((start + at - first + from) as *mut u8, title[from - first..].as_ptr(), n);
+            // `title` holds the run's stretch from offset `first`.
+            write.put(start + at - first + from, title[from - first..].as_ptr(), n);
             n
         };
         merged_stretches(&diffs, &changed).map(|(from, to)| put(from, to)).sum()
