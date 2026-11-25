@@ -652,7 +652,7 @@ void main() {
     }
 
     /// The compare of copies in the card's memory (`crate::host`), on the
-    /// software adapter. Told 1 it flags the pieces whose bytes are not
+    /// software adapter. Told 1 it flags the parts of pieces whose bytes are not
     /// what was hashed last and leaves the hashes: a piece a shader changed
     /// and a later one changed back then looks untouched, which is right
     /// only if the piece was fetched after both. Told 2 (submissions sent
@@ -669,7 +669,8 @@ void main() {
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;
         let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
-        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_hashes, _, hashes_gpu) =
+            warp.shared_buffer(16 * u64::from(PIECES * crate::shadow::CARD_PARTS));
         let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
         let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
         // SAFETY: the mapping holds `size` bytes.
@@ -690,13 +691,15 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                warp.list
+                    .Dispatch((PIECES * crate::shadow::CARD_PARTS).div_ceil(64), 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
             [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
         };
-        let at = PIECE + 1234;
+        // In part 5 of the second piece: its dword gets bit 5.
+        let at = PIECE + 5 * 4096 + 1234;
         // SAFETY (each): inside the mapping.
         let set = |value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
         // 0: the hashes are stored, nothing is flagged.
@@ -705,18 +708,18 @@ void main() {
         // A change in the second piece: flagged, and with 1 flagged again
         // (the hash stays the old one).
         set(content[at] ^ 0x40);
-        assert_eq!(run(&mut warp, 1), [0, 1, 0]);
-        assert_eq!(run(&mut warp, 1), [0, 1, 0]);
+        assert_eq!(run(&mut warp, 1), [0, 32, 0]);
+        assert_eq!(run(&mut warp, 1), [0, 32, 0]);
         // Changed back: with 1 the piece looks untouched.
         set(content[at]);
         assert_eq!(run(&mut warp, 1), [0, 0, 0]);
         // With 2 the change is flagged once, and the hash is the new one.
         set(content[at] ^ 0x40);
-        assert_eq!(run(&mut warp, 2), [0, 1, 0]);
+        assert_eq!(run(&mut warp, 2), [0, 32, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
         // Changed back: flagged, where 1 saw nothing.
         set(content[at]);
-        assert_eq!(run(&mut warp, 2), [0, 1, 0]);
+        assert_eq!(run(&mut warp, 2), [0, 32, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
     }
 
