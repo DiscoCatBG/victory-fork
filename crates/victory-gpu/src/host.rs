@@ -7530,6 +7530,13 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     if len == 0 {
         return;
     }
+    // A small write tries the one kernel call first: `mapped_run`'s
+    // `VirtualQuery` walks the page tables to the region's end (~0.6-2 ms in
+    // the title's big pools), more than the call costs when it succeeds.
+    // Callers such as `card_merge_relay` write many short stretches.
+    if len < (256 << 10) && write(dst as usize, len) {
+        return;
+    }
     // Title memory is view memory with holes: copy the committed runs at
     // memory speed and give the holes to the kernel, one piece at a time.
     let mut at = dst as usize;
