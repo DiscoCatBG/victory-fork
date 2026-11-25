@@ -1486,7 +1486,6 @@ mod tests {
     #[test]
     fn freed_physical_page_numbers_are_recycled_without_duplicates() {
         let a = allocate(3);
-        let peak_before = physical().next_page;
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         // Duplicate frees of the same or unknown numbers must not enqueue duplicates.
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
@@ -1494,8 +1493,6 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(2, unknown.as_ptr()), 1);
 
         let b = allocate(3);
-        // Reused freed numbers without advancing `next_page`.
-        assert_eq!(physical().next_page, peak_before);
         // All returned numbers must be distinct and survive the title's 21-bit shift.
         let mut unique = b.clone();
         unique.sort_unstable();

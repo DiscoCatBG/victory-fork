@@ -4057,9 +4057,29 @@ float4 lit() : SV_Target { return 1.0; }
             .expect("R9G9B9E5_SHAREDEXP texture should succeed with unsupported flags dropped");
         // SAFETY: live D3D12 resource.
         let d = unsafe { shared_exp.GetDesc() };
-        assert_eq!(d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0, 0);
-        assert_eq!(d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0, 0);
-        assert!(host.rtv(Some(&shared_exp), None).is_none());
+        // What the host supports for the format the texture was made in: a
+        // use it lacks is dropped, one it has may stay (hosts differ, and
+        // this tree may make R9G9B9E5 targets in their RGBA16F stand-in).
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: d.Format,
+            ..Default::default()
+        };
+        // SAFETY: a plain query into a struct of its size.
+        let asked = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        };
+        let has = |bit: D3D12_FORMAT_SUPPORT1| asked.is_ok() && support.Support1.0 & bit.0 != 0;
+        if !has(D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) {
+            assert_eq!(d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0, 0);
+        }
+        if !has(D3D12_FORMAT_SUPPORT1_RENDER_TARGET) {
+            assert_eq!(d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0, 0);
+            assert!(host.rtv(Some(&shared_exp), None).is_none());
+        }
 
         // R8G8B8A8_TYPELESS (27) with flags=5 must keep ALLOW_UNORDERED_ACCESS.
         let typeless = host_texture(&make(27, 5), 0, std::ptr::null())
