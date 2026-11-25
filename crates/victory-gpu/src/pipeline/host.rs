@@ -172,6 +172,38 @@ impl GraphicsState {
         }
     }
 
+    /// Makes the whole state one D3D12 accepts where the console is more
+    /// lenient; called once every subobject of the stream is read, before
+    /// the state is described or used.
+    ///
+    /// Blending asked for on an integer target is turned off for that
+    /// target: the console leaves such a target unblended, while D3D12
+    /// refuses the whole pipeline (E_INVALIDARG; a mesh pipeline with
+    /// R32_FLOAT, B4G4R4A4_UNORM and R8_UINT targets, all three blending,
+    /// was refused by an AMD host, and its draws were dropped).
+    pub(crate) fn settle(&mut self) {
+        let count = (self.targets.NumRenderTargets as usize).min(self.targets.RTFormats.len());
+        let independent = self.blend.IndependentBlendEnable.as_bool();
+        let integers: Vec<usize> = (0..count)
+            .filter(|&i| {
+                let state = &self.blend.RenderTarget[if independent { i } else { 0 }];
+                integer(self.targets.RTFormats[i]) && state.BlendEnable.as_bool()
+            })
+            .collect();
+        if integers.is_empty() {
+            return;
+        }
+        // One state for every target becomes one each, so that the targets
+        // that can blend still do.
+        if !independent {
+            self.blend.RenderTarget = [self.blend.RenderTarget[0]; 8];
+            self.blend.IndependentBlendEnable = true.into();
+        }
+        for i in integers {
+            self.blend.RenderTarget[i].BlendEnable = false.into();
+        }
+    }
+
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {
@@ -1043,6 +1075,34 @@ fn bounds_pipeline(
     )
 }
 
+/// Whether a target format holds integers, which D3D12 does not blend.
+fn integer(format: DXGI_FORMAT) -> bool {
+    matches!(
+        format,
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32B32_UINT
+            | DXGI_FORMAT_R32G32B32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R32G32_SINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8_UINT
+            | DXGI_FORMAT_R8_SINT
+    )
+}
+
 /// Zeroes the padding in a blend and a depth-stencil description: the
 /// title's (copied whole by [`GraphicsState::read`]) holds whatever its
 /// memory held, and the library compares a loaded pipeline's description
@@ -1164,6 +1224,51 @@ mod tests {
         };
         assert_eq!(states(0x00), states(0xab));
         assert_eq!(states(0x00), states(0xff));
+    }
+
+    #[test]
+    fn blending_is_off_for_integer_targets_and_kept_for_the_others() {
+        let blending = |g: &GraphicsState| {
+            g.blend.RenderTarget.map(|t| t.BlendEnable.as_bool())[..3].to_vec()
+        };
+        let title = |independent: bool| {
+            let mut g = GraphicsState::default();
+            g.targets.NumRenderTargets = 3;
+            g.targets.RTFormats[..3].copy_from_slice(&[
+                DXGI_FORMAT_R32_FLOAT,
+                DXGI_FORMAT_B4G4R4A4_UNORM,
+                DXGI_FORMAT_R8_UINT,
+            ]);
+            g.blend.IndependentBlendEnable = independent.into();
+            let states = if independent { 3 } else { 1 };
+            for t in &mut g.blend.RenderTarget[..states] {
+                (t.BlendEnable, t.DestBlend, t.BlendOp) =
+                    (true.into(), D3D12_BLEND_ONE, D3D12_BLEND_OP_MAX);
+            }
+            g
+        };
+        // A state for each target: the integer one stops blending.
+        let mut g = title(true);
+        g.settle();
+        assert_eq!(blending(&g), [true, true, false]);
+        // One state for all of them: each gets its own, the first's.
+        let mut g = title(false);
+        g.settle();
+        assert!(g.blend.IndependentBlendEnable.as_bool());
+        assert_eq!(blending(&g), [true, true, false]);
+        assert_eq!(g.blend.RenderTarget[1].BlendOp, D3D12_BLEND_OP_MAX);
+        // Nothing to do: the state is left as the title gave it.
+        let mut g = title(false);
+        g.targets.RTFormats[2] = DXGI_FORMAT_R8_UNORM;
+        let before = g.describe();
+        g.settle();
+        assert_eq!(g.describe(), before);
+        // A target past the count is not looked at.
+        let mut g = title(true);
+        g.targets.NumRenderTargets = 2;
+        let before = g.describe();
+        g.settle();
+        assert_eq!(g.describe(), before);
     }
 
     /// A triangle mesh shader of our own and a pixel shader for it.
