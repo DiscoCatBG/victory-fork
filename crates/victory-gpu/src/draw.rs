@@ -2732,6 +2732,24 @@ impl State {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
+                    // Bytes a flight in the air may write: copied on the card
+                    // from the host copy, behind the flight, instead of a
+                    // fill of upload memory that waits for it to land
+                    // (fxceless/victory-fork#522, `VICTORY_FILL_ON_CARD`).
+                    Some(View::Constant(address, size))
+                        if address != 0
+                            && crate::host::fill_on_card()
+                            && crate::host::late()
+                            && let size = crate::descriptor::constant_staging_bytes(size)
+                            && crate::host::flights_write(address as usize, address as usize + size as usize)
+                            && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                            && let Some(gpu) = {
+                                shadow.refresh(list, address, u64::from(size));
+                                list.card_constants(&shadow, address, u64::from(size))
+                            } =>
+                    {
+                        host.constant_at(index, gpu, size);
+                    }
                     Some(View::Constant(address, size)) if address != 0 => {
                         let size = crate::descriptor::constant_staging_bytes(size);
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
