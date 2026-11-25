@@ -373,6 +373,7 @@ fn wait(p: &Pending, frame: u64) {
         let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
         spent.finish(frame, left, waited, shared, Instant::now());
     }
+    crate::framelog::add(crate::framelog::T::PipelineWaitUs, started.elapsed().as_micros() as u64);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::PipelineWaitUs,

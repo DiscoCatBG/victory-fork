@@ -33,6 +33,27 @@ pub(crate) const PAGE: usize = 64 << 10;
 /// The kernel's page, the unit of its answers.
 const KERNEL_PAGE: usize = 4096;
 
+/// A title-memory range whose changed pages another subsystem needs to read.
+pub(crate) struct Tracked {
+    start: usize,
+    end: usize,
+    seen: Mutex<BTreeMap<usize, u64>>,
+}
+
+/// Tracks a runtime GPU-memory range, including physical-page views when
+/// `views` is true. Other process memory is not tracked.
+pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
+    let end = start.checked_add(len)?;
+    if len == 0 || writes(start, end, views).is_none() {
+        return None;
+    }
+    Some(Tracked {
+        start,
+        end,
+        seen: Mutex::default(),
+    })
+}
+
 struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
@@ -110,6 +131,17 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     if j.kept {
         return;
     }
+    // View memory the guards hold is left to `writes`, which answers it
+    // from the guards ([`known_view`]): the kernel's write watch can only
+    // fail there. Asked here with the others, a run holding such a range
+    // failed, was asked again by halves down to single ranges, failing
+    // each time, and the range then went to `writes` all the same (after
+    // triippywhale d0581a55). `VICTORY_VIEW_ASK=1` asks as before.
+    #[cfg(feature = "diagnostics")]
+    let all = pieces.len();
+    pieces.retain(|&(first, _)| !known_view(first * PAGE));
+    #[cfg(feature = "diagnostics")]
+    AHEAD_VIEWS.fetch_add((all - pieces.len()) as u64, std::sync::atomic::Ordering::Relaxed);
     j.asked += 1;
     j.ahead_asked = j.asked;
     j.ahead.clear();
@@ -148,6 +180,12 @@ fn slow(us: u64) {
     }
     SLOW[2].fetch_max(us, Relaxed);
 }
+
+/// Since the last frame line: ranges of view memory the guards hold that a
+/// submission's askings ahead ([`ask_ahead`], [`ask_once`]) left out. Each
+/// was a kernel asking that failed, or several, before.
+#[cfg(feature = "diagnostics")]
+pub(crate) static AHEAD_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// [`SLOW`], taken.
 #[cfg(feature = "diagnostics")]
@@ -216,6 +254,15 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         if start >= end || known_view(start) {
             continue;
         }
+        // View memory the guards hold is not asked about: the asking can
+        // only fail there, one failed kernel call for each such copy at
+        // every submission, and `writes` answers it from the guards
+        // (after triippywhale cc368c7c).
+        if known_view(start) {
+            #[cfg(feature = "diagnostics")]
+            AHEAD_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
         if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) || j.refused.contains(&(first, last)) {
             continue;
@@ -258,6 +305,34 @@ pub(crate) fn wrote(at: usize, len: usize) {
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         j.written.insert(page, now);
     }
+}
+
+/// We wrote the 64 KiB page numbered `page` of title memory through a
+/// view of our own (`crate::inplace::write_own`): no guard was opened and
+/// no kernel write-watch bit set, so the journal is told here. The page,
+/// and the same physical page at its other title addresses (`others`,
+/// page numbers), count as written at a new asking, which every host copy
+/// that holds them takes at its next refresh. Returns the asking that had
+/// last found `page` written (0: never) and the new one, for the copy
+/// that wrote to note itself current.
+pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    j.asked += 1;
+    let now = j.asked;
+    // As in [`wrote`]: an asking that stands for a submission, or for a
+    // flush, moves with it, or a copy taking the page at the standing
+    // asking would find it written "later" at every refresh.
+    if j.kept || !j.ahead.is_empty() {
+        j.ahead_asked = now;
+    }
+    let before = j.written.insert(page, now).unwrap_or(0);
+    for &other in others {
+        if other != page {
+            j.written.insert(other, now);
+        }
+    }
+    (before, now)
 }
 
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
@@ -396,6 +471,10 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    // View memory the guards already hold cannot be write-watched: the
+    // kernel asking would only fail. Copies of it are flushed many times a
+    // frame, each time paying that failed call before the guards answer.
+    let known_view = guarded && known_view(first * PAGE);
     // SAFETY: the answer buffer holds `count` entries.
     let failed = known
         || unsafe {
@@ -449,6 +528,76 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             .map(|(&p, &w)| (p, w))
             .collect(),
     ))
+}
+
+/// Diagnostics: one in 2,048 of the askings the kernel's write watch
+/// refused for memory the guards did not know (some 200 a frame in the
+/// first rooms, each followed by a question to Windows about the memory):
+/// what the memory is and what the guards hold of its first block.
+#[cfg(feature = "diagnostics")]
+fn failed_asking(start: usize, end: usize) {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2048 != 0 {
+        return;
+    }
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) };
+    let (protected, clean, absent, viewed, aliased) = {
+        let g = guards();
+        let b = start / BLOCK;
+        (g.protected.contains(&b), g.clean.contains(&b), g.absent.contains(&b), g.viewed.contains(&b), g.aliased.contains(&b))
+    };
+    tracing::info!(
+        "a failed write-watch asking (one in 2048): {start:#x}+{:#x}; Windows says (answered {n}): base {:#x} region {:#x} state {:#x} type {:#x} protect {:#x} allocation protect {:#x}; \
+         the guards of its first block: protected {protected} clean {clean} absent {absent} viewed {viewed} aliased {aliased}; is a view: {}",
+        end - start,
+        info.BaseAddress as usize,
+        info.RegionSize,
+        info.State,
+        info.Type,
+        info.Protect,
+        info.AllocationProtect,
+        is_view(start, end)
+    );
+}
+
+impl Tracked {
+    /// Takes changed pages of `[from, to)`, cut to the tracked range. A
+    /// partial page stays changed so a later take can read its other bytes.
+    pub(crate) fn take(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let (from, to) = (from.max(self.start), to.min(self.end));
+        if from >= to {
+            return Vec::new();
+        }
+        let Some((_, pages)) = writes(from, to, true) else {
+            return Vec::new();
+        };
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        for (page, write) in pages {
+            if seen.get(&page).is_some_and(|&last| last >= write) {
+                continue;
+            }
+            let (start, end) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+            if start >= end {
+                continue;
+            }
+            // Keep partial pages dirty: the caller has not taken the rest.
+            if (page * PAGE).max(self.start) >= from
+                && ((page + 1) * PAGE).min(self.end) <= to
+            {
+                seen.insert(page, write);
+            }
+            match ranges.last_mut() {
+                Some((_, last)) if *last == start => *last = end,
+                _ => ranges.push((start, end)),
+            }
+        }
+        ranges
+    }
 }
 
 /// Guarded blocks of view memory.
@@ -618,6 +767,12 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether the block `page` is read-only by our hand and unwritten since a
+/// copy took it (diagnostics of `VICTORY_BACK_OWN_CHECK`).
+pub(crate) fn clean(page: usize) -> bool {
+    guards().clean.contains(page)
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -1071,6 +1226,72 @@ pub(crate) fn wrote_aside(at: usize, len: usize) {
     crate::descriptor::host::remapped(at, len);
 }
 
+/// What `VICTORY_PAGE_WRITES` asks to be done with a write the guards do
+/// not see once its bytes are there ([`title_memory_written`]), as bits:
+/// 1, the guarded blocks under it are opened and count as written (host
+/// copies of buffers and textures read through tables take them again);
+/// 2, the placed textures picked by index that lie under it are due again;
+/// 4, both also for reads to plain addresses when they have finished.
+/// Unset or `guards`: bit 1 alone. `0`: nothing, counted only. `1`: bits 1
+/// and 2. `slots`: bit 2 alone. `all`: everything.
+pub(crate) fn page_writes() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_PAGE_WRITES").as_deref().map(str::trim) {
+        Ok("0") => 0,
+        Ok("1") => 3,
+        Ok("slots") => 2,
+        Ok("all") => 7,
+        _ => 1,
+    })
+}
+
+/// Since the start: writes into physical pages through the runtime's own
+/// views that landed at addresses the title has mapped (one for each run
+/// of addresses); their bytes; guarded blocks that lay under them (host
+/// copies that would otherwise keep the bytes from before); reads to
+/// plain addresses that finished.
+pub(crate) static WRITTEN: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// The bytes of a write the guards do not see are there: title memory
+/// `[at, at + len)`. `pages`: DirectStorage wrote them into physical pages
+/// through a view of the runtime's own, and this is an address where the
+/// title has those pages mapped (no title address faulted, nothing was
+/// mapped or unmapped). Otherwise a read to a plain address has finished,
+/// of which [`writing`] was told before it began.
+///
+/// Counted always and acted on as [`page_writes`] says. Called without
+/// the runtime's page-table lock; takes the guards' lock, then, alone, the
+/// lock of the ranges kept for the texture pass.
+pub fn title_memory_written(at: usize, len: usize, pages: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if len == 0 {
+        return;
+    }
+    let mode = page_writes();
+    let end = at.saturating_add(len);
+    if pages {
+        WRITTEN[0].fetch_add(1, Relaxed);
+        WRITTEN[1].fetch_add(len as u64, Relaxed);
+    } else {
+        WRITTEN[3].fetch_add(1, Relaxed);
+        if mode & 4 == 0 {
+            return;
+        }
+    }
+    {
+        let mut g = guards();
+        let guarded = g.protected.count_range(at / BLOCK, end.div_ceil(BLOCK)) as u64;
+        if pages {
+            WRITTEN[2].fetch_add(guarded, Relaxed);
+        }
+        if mode & 1 != 0 && guarded != 0 {
+            open(&mut g, at, end);
+        }
+    }
+    // A placed texture there changed with no descriptor written.
+    crate::descriptor::host::page_written(at, len);
+}
+
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
 /// of `section` (`crate::inplace::title_memory_view`): the view is
 /// writable, so the same bytes guarded at another view must be checked
@@ -1355,6 +1576,7 @@ fn install() {
         if open(&mut g, at, at + 1) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+            crate::framelog::add(crate::framelog::T::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {

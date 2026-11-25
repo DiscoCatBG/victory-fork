@@ -789,6 +789,22 @@ fn log_memory() {
         mb(card[0]),
         mb(card[3]),
     );
+    let targets = crate::resource::targets_census();
+    tracing::info!(
+        "host copies the sweep never lets go: {} the host renders to or writes {:.0} MB ({} of them placed {:.0} MB);          of them {} have title memory that is not mapped now {:.0} MB, {} were not used for 30 s and are held by no          list and no slot {:.0} MB, {} are both {:.0} MB; and {} copies of textures the title fills that the host          copied into {:.0} MB",
+        targets[0],
+        mb(targets[1]),
+        targets[10],
+        mb(targets[11]),
+        targets[2],
+        mb(targets[3]),
+        targets[4],
+        mb(targets[5]),
+        targets[6],
+        mb(targets[7]),
+        targets[8],
+        mb(targets[9]),
+    );
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
          {:.0} MB; of the windows alive, {:.0} MB lie between the lowest and highest address \
@@ -1024,6 +1040,9 @@ pub(crate) fn recorded(started: std::time::Instant, at: &'static std::panic::Loc
     RECORD_LINES[2 * line + 1].fetch_add(ns, Relaxed);
     add(C::RecordCalls, 1);
     add(C::RecordNs, ns);
+    crate::framelog::add(crate::framelog::T::RecordCalls, 1);
+    crate::framelog::add(crate::framelog::T::RecordNs, ns);
+    crate::framelog::here(crate::framelog::H::RecordNs, ns);
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
         let began = now_us().saturating_sub(ns / 1000);
         add(C::UntilRecordUs, began.saturating_sub(PRESENTED_AT.load(Relaxed)));
@@ -1037,6 +1056,12 @@ pub(crate) fn recorded(started: std::time::Instant, at: &'static std::panic::Loc
         return;
     }
     UNSENT.with(|u| u.set((0, 0)));
+    if crate::framelog::on() {
+        crate::framelog::add(crate::framelog::T::RecordLooks, 1);
+        if crate::framelog::on_slow_core() {
+            crate::framelog::add(crate::framelog::T::RecordSlow, 1);
+        }
+    }
     let id = thread_id();
     let mut all = RECORDERS.lock().unwrap_or_else(|e| e.into_inner());
     match all.iter_mut().find(|r| r.0 == id) {
@@ -1341,6 +1366,15 @@ pub(crate) fn log(frames: f64) {
         failed_at[3],
         c[C::WatchKnownView as usize]
     );
+    tracing::info!(
+        "  write-watch askings per frame that failed in the kernel: {:.0}; not made because the range \
+         is known guarded view memory: {:.0} (VICTORY_VIEW_ASK=1 asks the kernel anyway); such ranges left \
+         out of the submissions' askings ahead: {:.0}",
+        c[C::WatchFailed as usize],
+        c[C::WatchKnownView as usize],
+        crate::watch::AHEAD_VIEWS.swap(0, Relaxed) as f64 / frames,
+    );
+    crate::draw::window_line(frames);
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
