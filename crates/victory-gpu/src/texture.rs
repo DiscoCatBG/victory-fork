@@ -42,6 +42,10 @@ pub(crate) struct Staging {
     mips: u32,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
+    /// The bytes the staging buffer was made with
+    /// (`crate::host::upload_room`): it goes back to the pool of upload
+    /// buffers when the staging is dropped.
+    room: u64,
     memory: *const u8,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a submitted list's
@@ -450,6 +454,10 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        // The texture and every list that copied out of the buffer have let
+        // go of the staging (lists hold it until their reset, after their
+        // last submission finished): nothing on the card reads it.
+        crate::host::give_upload(self.buffer.clone(), self.data, self.room);
     }
 }
 
@@ -1222,7 +1230,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
+    let (buffer, data, room) = host.upload_pooled(total)?;
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1240,6 +1248,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         layout,
         mips: u32::from(d.MipLevels),
         bytes: total,
+        room,
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),

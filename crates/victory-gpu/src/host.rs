@@ -464,6 +464,71 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
 /// For the memory line: against what is alive, they show what was let go.
 pub(crate) static MADE: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
+/// Upload buffers kept for the next ask of their size instead of let go
+/// ([`Host::upload_pooled`], [`give_upload`]): the buffer, its mapping and
+/// its bytes, oldest first, and the bytes in all. The run of main ce79bfb
+/// made 195,898 upload buffers (69 GB) in seven minutes, most of them the
+/// staging of a texture let go and made again, each a committed resource
+/// the driver reserves, commits and zeroes, with under 4 GB left for the
+/// PC to commit.
+struct UploadPool {
+    kept: std::collections::VecDeque<(ID3D12Resource, usize, u64)>,
+    bytes: u64,
+}
+
+static UPLOAD_POOL: Mutex<UploadPool> = Mutex::new(UploadPool {
+    kept: std::collections::VecDeque::new(),
+    bytes: 0,
+});
+
+/// Upload buffers taken from [`UPLOAD_POOL`] instead of made, and their
+/// bytes, since the start (for the memory line).
+pub(crate) static UPLOADS_TAKEN: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The most [`UPLOAD_POOL`] keeps, in bytes: `VICTORY_UPLOAD_POOL_MB`
+/// (256 by default; 0 keeps none, and every upload buffer is made anew as
+/// before).
+fn upload_pool_most() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_UPLOAD_POOL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(256)
+            .min(4096)
+            << 20
+    })
+}
+
+/// The bytes an upload buffer for `size` bytes is made with, so that asks
+/// of nearly the same size share buffers: a multiple of 64 KiB up to
+/// 1 MiB, of an eighth of the next power of two above.
+pub(crate) fn upload_room(size: u64) -> u64 {
+    let size = size.max(1);
+    let step = if size <= 1 << 20 { 64 << 10 } else { size.next_power_of_two() >> 3 };
+    size.next_multiple_of(step)
+}
+
+/// Gives back an upload buffer of [`Host::upload_pooled`] that nothing on
+/// the card reads any more (every submission that named it has finished):
+/// kept for the next ask of its size, the oldest ones let go beyond
+/// [`upload_pool_most`].
+pub(crate) fn give_upload(buffer: ID3D12Resource, data: *mut u8, room: u64) {
+    let most = upload_pool_most();
+    if room > most {
+        return;
+    }
+    let mut pool = UPLOAD_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    pool.kept.push_back((buffer, data as usize, room));
+    pool.bytes += room;
+    while pool.bytes > most {
+        let Some((_, _, gone)) = pool.kept.pop_front() else {
+            break;
+        };
+        pool.bytes -= gone;
+    }
+}
+
 /// What of that is alive now, for the memory line (`MADE` counts what was
 /// ever made: 42,607 upload buffers, 77.9 GB, in five minutes of run 60,
 /// and nothing said how many were alive): host lists; the lists' scratch
@@ -3577,6 +3642,52 @@ fn late_line(frames: f64) {
              {runs:.0} changed runs, {:.2} MB",
             bytes / (1 << 20) as f64
         );
+    }
+}
+
+#[cfg(test)]
+mod upload_pool_tests {
+    use super::{give_upload, host, upload_room};
+
+    /// The room of an upload buffer holds what was asked for, wastes an
+    /// eighth at most above 1 MiB (64 KiB below), and is its own room.
+    #[test]
+    fn an_upload_buffers_room_is_a_little_more_than_asked() {
+        for size in [1u64, 4352, 65_536, 65_537, 1 << 20, (1 << 20) + 1, 5_000_000, 174 << 20] {
+            let room = upload_room(size);
+            assert!(room >= size, "{size}");
+            assert!(room - size < (64 << 10).max(size / 4), "{size} in {room}");
+            assert_eq!(upload_room(room), room, "{size}");
+        }
+        assert_eq!(upload_room(0), 64 << 10);
+    }
+
+    /// A buffer given back is the one the next ask of its room takes,
+    /// zeroed; an ask of another room makes its own.
+    #[test]
+    fn a_given_back_upload_buffer_is_taken_again_zeroed() {
+        use windows::core::Interface;
+        let Some(host) = host() else {
+            eprintln!("no host GPU; skipped");
+            return;
+        };
+        // A room no other test asks for.
+        let size = (3 << 20) + 12_345;
+        let (buffer, data, room) = host.upload_pooled(size).expect("a buffer");
+        assert_eq!(room, upload_room(size));
+        // SAFETY: the mapping holds `room` bytes.
+        unsafe { std::ptr::write_bytes(data, 0xAB, room as usize) };
+        let raw = buffer.as_raw() as usize;
+        give_upload(buffer, data, room);
+        let (other, _, other_room) = host.upload_pooled(size / 2).expect("a buffer");
+        assert_ne!(other.as_raw() as usize, raw);
+        assert_ne!(other_room, room);
+        let (again, data, again_room) = host.upload_pooled(size - 100).expect("a buffer");
+        assert_eq!(again.as_raw() as usize, raw);
+        assert_eq!(again_room, room);
+        // SAFETY: as above.
+        let bytes = unsafe { std::slice::from_raw_parts(data, room as usize) };
+        assert!(bytes.iter().all(|&b| b == 0));
     }
 }
 
@@ -7806,6 +7917,29 @@ impl Host {
                 None
             }
         }
+    }
+
+    /// A mapped upload buffer with room for `size` bytes
+    /// ([`upload_room`]: the third value), zeroed like a new one: one given
+    /// back with [`give_upload`] if there is one of that room, else made.
+    /// The caller gives it back when nothing reads it any more.
+    pub(crate) fn upload_pooled(&self, size: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+        let room = upload_room(size);
+        let kept = {
+            let mut pool = UPLOAD_POOL.lock().unwrap_or_else(|e| e.into_inner());
+            let at = pool.kept.iter().rposition(|&(_, _, r)| r == room);
+            at.and_then(|at| pool.kept.remove(at)).inspect(|_| pool.bytes -= room)
+        };
+        if let Some((buffer, data, _)) = kept {
+            UPLOADS_TAKEN[0].fetch_add(1, Ordering::Relaxed);
+            UPLOADS_TAKEN[1].fetch_add(room, Ordering::Relaxed);
+            let data = data as *mut u8;
+            // SAFETY: the buffer's whole mapping, which nothing else uses.
+            unsafe { std::ptr::write_bytes(data, 0, room as usize) };
+            return Some((buffer, data, room));
+        }
+        let (buffer, data) = self.upload_buffer(room)?;
+        Some((buffer, data, room))
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
