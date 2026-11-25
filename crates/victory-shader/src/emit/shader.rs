@@ -73,8 +73,14 @@ pub const SLOT_MEMORY: u8 = 254;
 pub const SLOT_FAULTS: u8 = 253;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
-/// Dwords of the [`SLOT_FAULTS`] buffer.
+/// Dwords of the fault notes at the start of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// After the fault notes in the [`SLOT_FAULTS`] buffer: one dword per
+/// copy number (dword [`MEMORY_FAULTS`] + n for number `n`, 0 being no
+/// copy), set to 1 by every store and atomic a running lane makes through
+/// that copy. The host reads and clears them to learn which copies shaders
+/// write, so that it need not take every copy for written (fxceless #346).
+pub const MEMORY_MARKS: u32 = 8192;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;
