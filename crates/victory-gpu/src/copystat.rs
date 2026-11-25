@@ -957,9 +957,23 @@ fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
     &mut all[at].1
 }
 
-/// A list call on this thread that began at `started` has returned.
-pub(crate) fn recorded(started: std::time::Instant) {
+/// Recorded list calls and their nanoseconds, by the line of `list.rs`
+/// that records them: `RECORD_LINES[2 * line]` and `+ 1`. The title's
+/// threads spend 61-65 ms each a frame on 14,000 calls (run 97), 4.6
+/// microseconds a call, and the frame cannot be shorter than that; which
+/// calls those are is what this says. Lines past the array are counted
+/// together at 0.
+static RECORD_LINES: [std::sync::atomic::AtomicU64; 2 * RECORD_LINES_MAX] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2 * RECORD_LINES_MAX];
+const RECORD_LINES_MAX: usize = 4096;
+
+/// A list call on this thread that began at `started` has returned; `at`
+/// is where in `list.rs` it is recorded.
+pub(crate) fn recorded(started: std::time::Instant, at: &'static std::panic::Location<'static>) {
     let ns = started.elapsed().as_nanos() as u64;
+    let line = (at.line() as usize).min(RECORD_LINES_MAX - 1);
+    RECORD_LINES[2 * line].fetch_add(1, Relaxed);
+    RECORD_LINES[2 * line + 1].fetch_add(ns, Relaxed);
     add(C::RecordCalls, 1);
     add(C::RecordNs, ns);
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
@@ -1297,6 +1311,27 @@ pub(crate) fn log(frames: f64) {
         .map(|r| format!("thread {} {:.0} ms in {:.0} calls", r.0, r.1 as f64 / 1e6 / frames, r.2 as f64 / frames))
         .collect();
     tracing::info!("  list calls by thread: {} threads; {}", recorders.len(), busiest.join(", "));
+    {
+        // The lines of `list.rs` the calls come from, the costliest first.
+        let mut lines: Vec<(u64, u64, usize)> = (0..RECORD_LINES_MAX)
+            .map(|line| (RECORD_LINES[2 * line + 1].swap(0, Relaxed), RECORD_LINES[2 * line].swap(0, Relaxed), line))
+            .filter(|&(ns, _, _)| ns > 0)
+            .collect();
+        lines.sort_unstable_by_key(|&(ns, _, _)| std::cmp::Reverse(ns));
+        let costliest: Vec<String> = lines
+            .iter()
+            .take(10)
+            .map(|&(ns, calls, line)| {
+                format!(
+                    "list.rs:{line} {:.1} ms in {:.0} ({:.1} us each)",
+                    ns as f64 / 1e6 / frames,
+                    calls as f64 / frames,
+                    ns as f64 / 1e3 / calls.max(1) as f64
+                )
+            })
+            .collect();
+        tracing::info!("  list calls by where they are recorded, per frame, the costliest first: {}", costliest.join(", "));
+    }
     log_memory();
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
