@@ -394,7 +394,7 @@ pub(crate) fn gone(window: bool, start: u64, len: u64) {
 /// the runtime to call before the title's own `VirtualFree` once it takes
 /// that call over.
 pub fn title_memory_freeing(at: usize, len: usize) {
-    if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
+    if len == 0 || STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
         return;
     }
     let gone = crate::shadow::in_place_let_go(at as u64, len as u64);
@@ -590,12 +590,16 @@ pub(crate) fn shows_view(at: usize) -> bool {
 /// the views that touch it are forgotten (the runtime tells again those it
 /// maps anew).
 pub(crate) fn views_gone(at: usize, len: usize) {
+    // (A zero length would make an inverted range below: fxceless #622.)
+    if len == 0 {
+        return;
+    }
     let mut v = views();
     if v.views.is_empty() {
         return;
     }
     let end = at.saturating_add(len);
-    let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
+    let first = v.views.range(..=at).next_back().filter(|(base, view)| base.saturating_add(view.0) > at).map(|(base, _)| *base);
     let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
     for base in gone {
         let Some((bytes, section, offset)) = v.views.remove(&base) else {
