@@ -118,6 +118,9 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .clone()
 }
 
+#[cfg(windows)]
+pub(crate) use host::depth_bounds_test;
+
 /// A translated shader and the console resources its code reads.
 #[cfg(windows)]
 pub(crate) struct Translated {
