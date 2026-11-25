@@ -5641,6 +5641,15 @@ impl Host {
     /// to be done once they have run comes back with the submission lock
     /// still held.
     fn submit<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        // D3D12 forbids a command list twice in one `ExecuteCommandLists`
+        // (drivers hang: DXGI_ERROR_DEVICE_HUNG), and a list's second
+        // `prelude` would reset the one queued for its first occurrence.
+        // Split at a duplicate: the part before it runs (and is waited for)
+        // first (fxceless/victory-fork#675).
+        if let Some(split) = first_duplicate(runs) {
+            let _ = self.submit(&runs[..split], false);
+            return self.submit(&runs[split..], late);
+        }
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -8793,6 +8802,38 @@ mod spare {
         assert_eq!(spare.take(1), Some(2));
         assert_eq!(spare.bytes, 0);
         assert!(spare.kept.is_empty());
+    }
+}
+
+/// Index of the first list in `runs` that already appeared earlier in
+/// `runs` (by identity), or `None` if every list is distinct.
+fn first_duplicate(runs: &[&HostList]) -> Option<usize> {
+    if runs.len() <= 1 {
+        return None;
+    }
+    let mut seen = std::collections::HashSet::with_capacity(runs.len());
+    runs.iter().position(|list| !seen.insert(std::ptr::from_ref(*list) as usize))
+}
+
+#[cfg(test)]
+mod duplicate_lists {
+    /// A submission naming one list twice is split at the second
+    /// occurrence and runs to the end (fxceless/victory-fork#675).
+    #[test]
+    fn a_list_named_twice_is_submitted_in_two_parts() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let a = host.new_list().unwrap();
+        a.close();
+        let b = host.new_list().unwrap();
+        b.close();
+        assert_eq!(super::first_duplicate(&[]), None);
+        assert_eq!(super::first_duplicate(&[&a]), None);
+        assert_eq!(super::first_duplicate(&[&a, &b]), None);
+        assert_eq!(super::first_duplicate(&[&a, &a]), Some(1));
+        assert_eq!(super::first_duplicate(&[&a, &b, &a]), Some(2));
+        host.execute(&[&a, &b, &a]);
     }
 }
 
