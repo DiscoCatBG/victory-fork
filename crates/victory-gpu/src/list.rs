@@ -1937,6 +1937,17 @@ extern "system" fn draw(_: This) {
     count_draw();
 }
 
+/// Checked byte address inside `buffer` at `offset` with at least `min_bytes`
+/// remaining, preventing `u64` address wrap and out-of-bounds aliasing.
+fn buffer_at(buffer: This, offset: u64, min_bytes: u64) -> Option<u64> {
+    let (p, size) = crate::resource::buffer_bytes(buffer)?;
+    let end = offset.checked_add(min_bytes)?;
+    if end > size {
+        return None;
+    }
+    (p as u64).checked_add(offset)
+}
+
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
 /// offset)`. The title's signatures (title+0x2479466, 2026-11-24)
 /// hold one argument each: draw (stride 16), indexed draw (20), dispatch
@@ -1959,8 +1970,15 @@ extern "system" fn execute_indirect(
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
-    let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
-    let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    let min_bytes = if count.is_null() {
+        (max as u64).saturating_mul(stride as u64)
+    } else if max > 0 {
+        stride as u64
+    } else {
+        0
+    };
+    let address = buffer_at(arguments, offset, min_bytes);
+    let counter = buffer_at(count, count_offset, 4);
     let mut ran = false;
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
