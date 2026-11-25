@@ -88,7 +88,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         let g = guards();
         pieces.retain(|&(first, _)| {
             let block = first * PAGE / BLOCK;
-            !(g.protected.contains(block) || g.absent.contains(block))
+            !g.views.contains(block)
         });
     }
     if pieces.len() < 2 {
@@ -414,17 +414,17 @@ fn view_ask() -> bool {
     *ASK.get_or_init(|| ["VICTORY_VIEW_ASK", "VICTORY_GUARD_ASK"].iter().any(|n| std::env::var_os(n).is_some_and(|v| v == "1")))
 }
 
-/// Whether the block holding `start` is view memory the guards already
-/// hold (read-only by our hand, or noted absent): asking the kernel's write
-/// watch about it can only fail. The guards take a range the same way, by
-/// its first block ([`guard`]).
+/// Whether the block holding `start` is view memory the guards took
+/// (`Guards::views`: read-only by our hand, noted absent, or opened again
+/// by a write): asking the kernel's write watch about it can only fail.
+/// The guards take a range the same way, by its first block ([`guard`]).
 fn known_view(start: usize) -> bool {
     if view_ask() {
         return false;
     }
     let g = guards();
     let first = start / BLOCK;
-    g.protected.contains(first) || g.absent.contains(first)
+    g.views.contains(first)
 }
 
 /// Words of block bits per chunk of [`Blocks`]: a chunk holds 16,384
@@ -545,6 +545,15 @@ struct Guards {
     /// (those views' blocks are in it too): a write to one opens them all.
     /// A write range can be huge (`fread`), so only these are looked up.
     aliased: Blocks,
+    /// Blocks the guards took as view memory (made read-only or noted
+    /// absent) since the runtime last mapped or unmapped there: a block
+    /// the title has written is open again and in neither of those sets,
+    /// and is a view all the same. Asked about a range that begins in such
+    /// a block, the kernel's write watch can only fail (350 to 480 failed
+    /// askings a frame in the run of main ce79bfb, after cc368c7 took out
+    /// the ones for blocks still guarded), and Windows need not be asked
+    /// again whether the range is a view.
+    views: Blocks,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -552,6 +561,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     clean: Blocks { chunks: BTreeMap::new(), len: 0 },
     absent: Blocks { chunks: BTreeMap::new(), len: 0 },
     aliased: Blocks { chunks: BTreeMap::new(), len: 0 },
+    views: Blocks { chunks: BTreeMap::new(), len: 0 },
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -572,8 +582,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
         let g = guards();
-        let first = start / BLOCK;
-        g.protected.contains(first) || g.absent.contains(first)
+        g.views.contains(start / BLOCK)
     };
     if !known && !is_view(start, end) {
         return None;
@@ -743,6 +752,7 @@ fn protect_alias(g: &mut Guards, block: usize) {
     // SAFETY: title view memory; only its protection changes.
     if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
         g.protected.insert(block);
+        g.views.insert(block);
     }
 }
 
@@ -764,6 +774,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.insert_range(from, to);
         g.clean.insert_range(from, to);
+        g.views.insert_range(from, to);
     };
     if set(from, to) {
         note(g, from, to);
@@ -774,6 +785,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
             note(g, block, block + 1);
         } else if block < uncommitted_end(block) {
             g.absent.insert(block);
+            g.views.insert(block);
         }
     }
 }
@@ -1085,6 +1097,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     g.protected.remove_range(first, last);
     g.clean.remove_range(first, last);
     g.aliased.remove_range(first, last);
+    g.views.remove_range(first, last);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -1235,6 +1248,51 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A view block the title wrote is open again, and still known for a
+    /// view: the write watch is not asked about a range that begins there,
+    /// until the runtime maps or unmaps it.
+    #[test]
+    fn a_written_view_block_is_still_known_for_a_view() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        assert!(!known_view(view));
+        assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
+        assert!(known_view(view) && known_view(view + BLOCK));
+        // The title writes the first block: our handler opens it.
+        // SAFETY: a byte of our view.
+        unsafe { (view as *mut u8).write_volatile(7) };
+        assert!(!guards().protected.contains(view / BLOCK));
+        assert!(known_view(view));
+        // Asked again, the block is reported written and guarded again.
+        assert_eq!(writes(view, view + 2 * BLOCK, true).map(|w| w.1.len()), Some(BLOCK / PAGE));
+        assert!(guards().protected.contains(view / BLOCK));
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as *mut _,
+                },
+            )
+        };
+        title_memory_remapped(view, 2 * BLOCK);
+        assert!(!known_view(view) && !known_view(view + BLOCK));
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
