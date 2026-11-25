@@ -2853,14 +2853,18 @@ fn plan_forwards(runs: &[&HostList]) -> (Vec<Forward>, Vec<(usize, usize, usize)
                         // copy under flights ([`stale_under_flights`]). The
                         // copy then holds what title memory will hold after
                         // the copy-back, as far as the title has written by
-                        // now. (A compare of the whole range with the
-                        // snapshot asked for more: the title's other threads
-                        // write these ranges all the time, and in the runs
-                        // on main 371ba00 and 9e6137f it held for no
-                        // refresh at all.)
+                        // now.
                         let mut runs_left = 512;
                         if w.merge_under_writes(a, b - a, &mut runs_left) {
                             why = Some(12);
+                        } else if !w.pending_holds(a, b) {
+                            // The copy-back's thread ended a range between
+                            // the question above and the merge, which then
+                            // put in nothing there (it answers false for a
+                            // range no shaders write). Ranges only end
+                            // meanwhile, so one that is held now was held
+                            // for the merge.
+                            why = Some(16);
                         } else {
                             // One range in 16 is looked at for the line of
                             // flights: the title's bytes the copy lacks.
@@ -3469,18 +3473,26 @@ mod forward_tests {
         let start = title.as_ptr() as usize;
         let (a_buffer, a_data) = host.shared_buffer(LEN as u64).expect("a buffer");
         let (b_buffer, b_data) = host.shared_buffer(LEN as u64).expect("a buffer");
+        // The writer holds the title's bytes, but for one of its last page,
+        // when shaders are given all of it: that is its snapshot.
         // SAFETY: the mappings hold LEN bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(title.as_ptr(), a_data, LEN);
+            *a_data.add(2 * 4096) ^= 1;
+            std::ptr::write_bytes(b_data, 0xEE, LEN);
+        }
+        let a = Arc::new(crate::shadow::Shadow::for_test(a_buffer, a_data, start as u64, LEN as u64, None));
+        let b = Arc::new(crate::shadow::Shadow::for_test(b_buffer, b_data, start as u64, LEN as u64, None));
+        assert!(!a.snapshot_is_title(start + 4096, start + 2 * 4096));
+        a.writing(start, LEN);
+        crate::shadow::take_snapshots();
+        // What the shaders write.
+        // SAFETY: as above.
         unsafe {
             for i in 0..LEN {
                 *a_data.add(i) = (i % 251) as u8;
             }
-            std::ptr::write_bytes(b_data, 0xEE, LEN);
         }
-        // The writer's snapshot: the title's bytes, but for its last page.
-        let mut before = title.clone();
-        before[2 * 4096] ^= 1;
-        let a = Arc::new(crate::shadow::Shadow::for_test(a_buffer, a_data, start as u64, LEN as u64, Some(before)));
-        let b = Arc::new(crate::shadow::Shadow::for_test(b_buffer, b_data, start as u64, LEN as u64, None));
         assert!(a.snapshot_is_title(start + 4096, start + 2 * 4096));
         assert!(!a.snapshot_is_title(start + 4096, start + 3 * 4096));
         assert!(!b.snapshot_is_title(start, start + 4096));

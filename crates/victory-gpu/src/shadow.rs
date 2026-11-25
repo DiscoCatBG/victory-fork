@@ -2199,13 +2199,35 @@ impl Shadow {
         if !self.plain() || address >= end || address < start || end > start + self.len as usize {
             return false;
         }
-        let (from, to) = (address - start, end - start);
+        let mut now = vec![0u8; end - address];
+        self.snapshot_at(address, end, |taken| crate::host::read_into(address as *const u8, &mut now) && now == taken)
+            .unwrap_or(false)
+    }
+
+    /// Runs `with` on the snapshot's bytes of title range `[address, end)`
+    /// of this plain copy, under the snapshot's lock. `None` unless ranges
+    /// shaders of flights in the air may be writing hold all of it: only
+    /// there does the snapshot hold bytes. (`writing` takes the declared
+    /// parts into memory that is reserved and never given a length, so the
+    /// snapshot is read by its pointer here as everywhere else: a slice of
+    /// the `Vec` is empty.) For the submitting thread: the copy-back's
+    /// thread only ends ranges, and gives the snapshot back when the last
+    /// one ends (then `None`).
+    fn snapshot_at<R>(&self, address: usize, end: usize, with: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        let start = self.start as usize;
+        if !self.plain() || !self.pending_holds(address, end) || address < start || end > start + self.len as usize {
+            return None;
+        }
         let before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(taken) = before.as_ref().and_then(|b| b.get(from..to)) else {
-            return false;
-        };
-        let mut now = vec![0u8; to - from];
-        crate::host::read_into(address as *const u8, &mut now) && now == taken
+        let snapshot = before.as_ref()?;
+        if snapshot.capacity() < end - start {
+            return None;
+        }
+        // SAFETY: the allocation holds the copy's length (checked), and
+        // these bytes are in a declared range, which `writing` or
+        // `take_snapshots` wrote.
+        let taken = unsafe { std::slice::from_raw_parts(snapshot.as_ptr().add(address - start), end - address) };
+        Some(with(taken))
     }
 
     /// Whether the copy has a snapshot at all (taken when a submission
@@ -2293,17 +2315,16 @@ impl Shadow {
         if !self.plain() || address >= end || address < start || end > start + self.len as usize {
             return None;
         }
-        let (from, to) = (address - start, end - start);
-        let before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let taken = before.as_ref()?.get(from..to)?;
-        let mut now = vec![0u8; to - from];
-        if !crate::host::read_into(address as *const u8, &mut now) {
-            return None;
-        }
-        // SAFETY: inside the mapping; the card may write it meanwhile, and
-        // each byte read is one it held at some moment.
-        let held = unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) };
-        Some(now.iter().zip(taken).zip(held).filter(|&((t, s), d)| t != s && d == s).count())
+        let mut now = vec![0u8; end - address];
+        self.snapshot_at(address, end, |taken| {
+            if !crate::host::read_into(address as *const u8, &mut now) {
+                return None;
+            }
+            // SAFETY: inside the mapping; the card may write it meanwhile,
+            // and each byte read is one it held at some moment.
+            let held = unsafe { std::slice::from_raw_parts(self.data.add(address - start), end - address) };
+            Some(now.iter().zip(taken).zip(held).filter(|&((t, s), d)| t != s && d == s).count())
+        })?
     }
 
     /// Title range `[address, end)` of this copy is about to be filled on
