@@ -2265,11 +2265,45 @@ impl Shadow {
         *self.handed.lock().unwrap_or_else(|e| e.into_inner()) = ranges;
     }
 
-    /// Whether a copy queued on the card fills part of title range
-    /// `[address, end)` of this copy ([`Shadow::hand`]): the CPU puts
-    /// nothing there until the card has passed it.
-    pub(crate) fn handed_holds(&self, address: usize, end: usize) -> bool {
-        self.handed.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < end && e > address)
+    /// Whether ranges shaders of flights in the air may be writing hold
+    /// all of title range `[address, end)` of this copy: its snapshot holds
+    /// those bytes, and [`Shadow::merge_under_writes`] keeps it and the
+    /// copy at what the title wrote.
+    pub(crate) fn pending_holds(&self, address: usize, end: usize) -> bool {
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        address < end && outside(address, end, pending).is_empty()
+    }
+
+    /// Whether this is a plain copy no flight's shaders may be writing
+    /// over title range `[address, end)`: a refresh brings all of it up to
+    /// date ([`Shadow::update`] leaves nothing out).
+    pub(crate) fn free(&self, address: usize, end: usize) -> bool {
+        self.plain() && !self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < end && e > address)
+    }
+
+    /// Of title range `[address, end)` of this plain copy, inside a range
+    /// its shaders may be writing: how many bytes the title holds that
+    /// neither the snapshot nor the copy has (the title wrote them and
+    /// they were not put in; a byte the copy holds differently from its
+    /// snapshot is the card's). For the count on the line of flights
+    /// (`crate::host::alias_forward`): what a copy on the card would not
+    /// have carried. `None` where it cannot be told.
+    pub(crate) fn title_missing(&self, address: usize, end: usize) -> Option<usize> {
+        let start = self.start as usize;
+        if !self.plain() || address >= end || address < start || end > start + self.len as usize {
+            return None;
+        }
+        let (from, to) = (address - start, end - start);
+        let before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = before.as_ref()?.get(from..to)?;
+        let mut now = vec![0u8; to - from];
+        if !crate::host::read_into(address as *const u8, &mut now) {
+            return None;
+        }
+        // SAFETY: inside the mapping; the card may write it meanwhile, and
+        // each byte read is one it held at some moment.
+        let held = unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) };
+        Some(now.iter().zip(taken).zip(held).filter(|&((t, s), d)| t != s && d == s).count())
     }
 
     /// Title range `[address, end)` of this copy is about to be filled on
@@ -2284,6 +2318,7 @@ impl Shadow {
     /// are what title memory holds there now. For a range no flight's
     /// shaders are writing (the card is not changing the bytes); false
     /// outside the copy or where title memory cannot be read.
+    #[cfg(test)]
     pub(crate) fn holds_title(&self, address: usize, end: usize) -> bool {
         let start = self.start as usize;
         if !self.plain() || address >= end || address < start || end > start + self.len as usize {
