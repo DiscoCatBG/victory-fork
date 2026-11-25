@@ -259,6 +259,85 @@ fn run_cases_on(
     assert!(ran > 0, "no SM 6.6 device available ({devices:?})");
 }
 
+#[test]
+fn scalar_wqm_ir_tracks_register_widths_and_scc() {
+    for (word, name, dwords) in [
+        (0xBE90_0900u32, "s_wqm_b32", 1),
+        (0xBE90_0A00, "s_wqm_b64", 2),
+    ] {
+        let code: Vec<u8> = [word, S_ENDPGM]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let program = ir::build(&code, false, 16).expect("WQM IR");
+        let inst = &program.blocks[0].insts[0];
+        assert_eq!(inst.name(), name);
+        assert_eq!(inst.reads.len(), usize::from(dwords));
+        assert_eq!(inst.writes.len(), usize::from(dwords) + 1);
+        for half in 0..dwords {
+            assert!(
+                inst.read(ir::Reg::S(half)).is_some(),
+                "{name}: source {half}"
+            );
+            assert!(
+                inst.write(ir::Reg::S(16 + half)).is_some(),
+                "{name}: destination {half}"
+            );
+        }
+        assert!(inst.write(ir::Reg::Scc).is_some(), "{name}: SCC");
+    }
+}
+
+#[test]
+fn scalar_wqm_expands_nibbles_and_sets_scc() {
+    if let Some(path) = std::env::var_os("VICTORY_DXIL") {
+        validator::Validator::load(Some(std::path::Path::new(&path)))
+            .expect("load explicitly configured DXIL validator");
+    }
+
+    // Each case lists [source low, source high] and [result low, result high, SCC].
+    let narrow = [
+        ([0, 0], [0, 0, 0]),
+        ([0x0000_0001, 0], [0x0000_000F, 0, 1]),
+        ([0x0000_0020, 0], [0x0000_00F0, 0, 1]),
+        ([0x0000_0400, 0], [0x0000_0F00, 0, 1]),
+        ([0x8000_0000, 0], [0xF000_0000, 0, 1]),
+        ([0x1020_4080, 0], [0xF0F0_F0F0, 0, 1]),
+        ([u32::MAX, 0], [u32::MAX, 0, 1]),
+    ];
+    let wide = [
+        ([0, 0], [0, 0, 0]),
+        ([0x0000_0001, 0], [0x0000_000F, 0, 1]),
+        ([0, 0x0000_0001], [0, 0x0000_000F, 1]),
+        ([0x8000_0001, 0x0040_0020], [0xF000_000F, 0x00F0_00F0, 1]),
+        ([u32::MAX, u32::MAX], [u32::MAX, u32::MAX, 1]),
+        ([0x7654_3210, 0xFEDC_BA98], [0xFFFF_FFF0, u32::MAX, 1]),
+    ];
+    for (word, cases, outputs) in [
+        (0xBE90_0900, narrow.as_slice(), &[0, 2][..]), // s_wqm_b32 s16, s0
+        (0xBE90_0A00, wide.as_slice(), &[0, 1, 2][..]), // s_wqm_b64 s[16:17], s[0:1]
+    ] {
+        let inputs: Vec<_> = cases.iter().map(|&([lo, hi], _)| [lo, hi, 0, 0]).collect();
+        for &output in outputs {
+            let shader = build_valu_cs(&[
+                word,
+                sop2(0x0a, 18, 129, 128), // s_cselect_b32 s18, 1, 0
+                vop1(1, 0, sgpr(16 + output as u8)),
+            ]);
+            let container = crate::Container::parse(&shader.dxil).unwrap();
+            let sfi0 = container.part(crate::FourCC::SFI0).unwrap();
+            let features = u64::from_le_bytes(sfi0.data.try_into().unwrap());
+            assert_eq!(features & 0x8000, 0, "WQM must not require Int64");
+            run_cases(&shader, &inputs, |backend, i, input, got| {
+                assert_eq!(
+                    got, cases[i].1[output],
+                    "{backend}: {word:#x}, {input:08x?}, output {output}"
+                );
+            });
+        }
+    }
+}
+
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }
@@ -1765,6 +1844,187 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
     }
 }
 
+/// MUBUF `buffer_load_*` with `offen = 1`, `soffset = 0`, `offset = 0`.
+const fn mubuf_load_offen(op: u8, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+    [
+        0x38 << 26 | (op as u32 & 0x7F) << 18 | 1 << 12,
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+#[test]
+fn cbv_narrow_buffer_loads_extract_and_sign_extend() {
+    // CBV contents (64 bytes = 16 dwords, 16-byte rows):
+    //   dword 0 (bytes 0..4):   [0x05, 0xFE, 0x7F, 0x81]
+    //   dword 1 (bytes 4..8):   [0x01, 0x80, 0xAB, 0xCD]
+    //   dword 2 (bytes 8..12):  [0x00, 0x00, 0x00, 0x00]
+    //   dword 3 (bytes 12..16): [0x00, 0x00, 0x00, 0x80]
+    //   dword 4 (bytes 16..20): [0xDE, 0xAD, 0xBE, 0xEF] (cross-16-byte-row straddle at 15)
+    let cbv_data: [u32; 16] = [
+        0x817F_FE05,
+        0xCDAB_8001,
+        0x0000_0000,
+        0x8000_0000,
+        0xEFBE_ADDE,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
+    let bytes: Vec<u8> = cbv_data.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let offsets: &[u32] = &[0, 1, 2, 3, 4, 5, 7, 15, 16, 19];
+
+    // MUBUF opcodes: ubyte=0x08, sbyte=0x09, ushort=0x0a, sshort=0x0b.
+    let ops: &[(u8, u32, bool, &str)] = &[
+        (0x08, 8, false, "buffer_load_ubyte"),
+        (0x09, 8, true, "buffer_load_sbyte"),
+        (0x0A, 16, false, "buffer_load_ushort"),
+        (0x0B, 16, true, "buffer_load_sshort"),
+    ];
+
+    for &(op, bits, signed, name) in ops {
+        let mut words = Vec::new();
+        words.push(s_mov_b32(5, 0x80)); // s5 = 0
+        words.extend_from_slice(&s_load_dwordx4(8, 4)); // s[8:11] = CBV at offset 0
+        // s_load_dwordx4 s[12:15], s[4:5], 0x20 (UAV at table offset 8 dwords)
+        words.extend_from_slice(&[0xF408_0302, 0xFA00_0020]);
+        words.push(vop1(0x001, 1, sgpr(0))); // v1 = byte offset from root constant s0
+        words.extend_from_slice(&mubuf_load_offen(op, 0, 1, 8)); // v0 = narrow load from CBV
+        words.extend_from_slice(&buffer_store_dword(0, 12, 0));
+        words.push(S_ENDPGM);
+
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![
+                UsedResource {
+                    kind: ResourceType::Cbv,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+                UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 8,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let l = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        let mut dxil = l.dxil;
+        #[cfg(windows)]
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut dxil).unwrap();
+        }
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil,
+            user_data: l.user_data,
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: l.root_cbvs,
+            root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
+            root_indexed_views: Vec::new(),
+        };
+        #[cfg(windows)]
+        for (backend, warp) in [("hardware", false), ("WARP", true)] {
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            let (root, pso) = host.compute_pipeline(&shader).unwrap();
+            for &off in offsets {
+                let want = match (bits, signed) {
+                    (8, false) => u32::from(bytes[off as usize]),
+                    (8, true) => (bytes[off as usize] as i8) as i32 as u32,
+                    (16, false) => u32::from(u16::from_le_bytes([
+                        bytes[off as usize],
+                        bytes[off as usize + 1],
+                    ])),
+                    (16, true) => (i16::from_le_bytes([
+                        bytes[off as usize],
+                        bytes[off as usize + 1],
+                    ])) as i32 as u32,
+                    _ => unreachable!(),
+                };
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(vec![off, 0, 0, 0, 0]))],
+                            views: &[View::Cbv(&cbv_data), View::RawUav(16)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    out[0][0], want,
+                    "{backend}: {name} at CBV byte offset {off} = {:#010x}, want {want:#010x}",
+                    out[0][0],
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn glc_heap_uav_loads_stores_and_atomics_execute_on_gpu() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
@@ -1994,4 +2254,126 @@ fn glc_heap_uav_loads_stores_and_atomics_execute_on_gpu() {
         ran == 2,
         "expected both hardware GPU and WARP to run, got {ran}"
     );
+}
+
+#[test]
+fn scalar_sign_extension_preserves_scc() {
+    for (opcode, byte) in [(0x19, true), (0x1a, false)] {
+        let shader = build_valu_cs(&[
+            0xbf06_8001,               // s_cmp_eq_u32 s1, 0
+            0xbe86_0000 | opcode << 8, // sign-extend s0 into s6
+            sop2(0x0a, 7, 6, 2),       // s_cselect_b32 s7, s6, s2
+            vop1(0x001, 0, sgpr(7)),
+        ]);
+        let mut cases = Vec::new();
+        for input in [
+            0,
+            0xffff_007f,
+            0x1234_0080,
+            0xaaaa_7fff,
+            0x5555_8000,
+            u32::MAX,
+        ] {
+            for flag_input in [0, 1] {
+                cases.push([input, flag_input, 0x1234_5678, 0]);
+            }
+        }
+        run_cases(
+            &shader,
+            &cases,
+            |backend, _, [input, flag_input, fallback, _], got| {
+                let extended = if byte {
+                    i32::from(input as i8)
+                } else {
+                    i32::from(input as i16)
+                };
+                assert_eq!(
+                    got,
+                    if flag_input == 0 {
+                        extended as u32
+                    } else {
+                        fallback
+                    },
+                    "{backend}"
+                );
+            },
+        );
+    }
+    }
+
+#[test]
+fn movrel_masks_m0_to_8_bits_and_allows_non_vgpr_src0() {
+    const M0: u8 = 124;
+
+    // v_movrels_b32 v0, v2: v2..v4 hold s1..s3, s0 goes into M0 with non-zero upper bits.
+    let movrels = build_valu_cs(&[
+        s_mov_b32(M0, 0),
+        vop1(0x043, 0, vgpr(2)), // v_movrels_b32 v0, v2
+    ]);
+    let rels_cases: &[([u32; 4], u32)] = &[
+        ([0x1234_5600, 0xAAAA, 0xBBBB, 0xCCCC], 0xAAAA),
+        ([0xABCD_EF01, 0xAAAA, 0xBBBB, 0xCCCC], 0xBBBB),
+        ([0xFFFF_FF02, 0xAAAA, 0xBBBB, 0xCCCC], 0xCCCC),
+    ];
+    let rels_in: Vec<[u32; 4]> = rels_cases.iter().map(|c| c.0).collect();
+    run_cases(&movrels, &rels_in, |backend, i, inp, got| {
+        let want = rels_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_movrels_b32(m0={:#010x}) = {got:#x}, want {want:#x}",
+            inp[0],
+        );
+    });
+
+    // v_movreld_b32 with SGPR src0 (s1) and inline-constant src0 (42), plus M0 upper bits.
+    for (src0, written) in [(sgpr(1), 0x7777u32), (0x80 + 42, 42u32)] {
+        let movreld = build_valu_cs(&[
+            vop1(0x001, 5, 0x80 + 11), // v5 = 11
+            vop1(0x001, 6, 0x80 + 22), // v6 = 22
+            vop1(0x001, 7, 0x80 + 33), // v7 = 33
+            s_mov_b32(M0, 0),          // M0 = s0 (write index in low byte)
+            vop1(0x042, 5, src0),      // v_movreld_b32 v5, src0
+            s_mov_b32(M0, 2),          // M0 = s2 (read index in low byte)
+            vop1(0x043, 0, vgpr(5)),   // v_movrels_b32 v0, v5
+        ]);
+        let reld_cases: &[([u32; 4], u32)] = &[
+            ([0xCAFE_BA01, written, 0xDEAD_0000, 0], 11),
+            ([0xCAFE_BA01, written, 0xDEAD_0001, 0], written),
+            ([0xCAFE_BA01, written, 0xDEAD_0002, 0], 33),
+        ];
+        let reld_in: Vec<[u32; 4]> = reld_cases.iter().map(|c| c.0).collect();
+        run_cases(&movreld, &reld_in, |backend, i, inp, got| {
+            let want = reld_cases[i].1;
+            assert_eq!(
+                got, want,
+                "{backend}: v_movreld_b32(src0={src0}, m0={:#010x}, read={:#010x}) = {got:#x}, want {want:#x}",
+                inp[0], inp[2],
+            );
+        });
+    }
+
+    // v_movrelsd_b32 v5, v2: copies v[2 + M0[7:0]] into v[5 + M0[7:0]] while leaving siblings intact.
+    let movrelsd = build_valu_cs(&[
+        vop1(0x001, 5, 0x80 + 1), // v5 = 1
+        vop1(0x001, 6, 0x80 + 2), // v6 = 2
+        vop1(0x001, 7, 0x80 + 3), // v7 = 3
+        s_mov_b32(M0, 0),         // M0 = s0
+        vop1(0x044, 5, vgpr(2)),  // v_movrelsd_b32 v5, v2
+        s_mov_b32(M0, 3),         // M0 = s3 (read index)
+        vop1(0x043, 0, vgpr(5)),  // v_movrels_b32 v0, v5
+    ]);
+    let relsd_cases: &[([u32; 4], u32)] = &[
+        ([0xBEEF_0001, 0x1111, 0x2222, 0x4444_0000], 1),
+        ([0xBEEF_0001, 0x1111, 0x2222, 0x4444_0001], 0x2222),
+        ([0xBEEF_0001, 0x1111, 0x2222, 0x4444_0002], 3),
+    ];
+    let relsd_in: Vec<[u32; 4]> = relsd_cases.iter().map(|c| c.0).collect();
+    run_cases(&movrelsd, &relsd_in, |backend, i, inp, got| {
+        let want = relsd_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_movrelsd_b32(m0={:#010x}, read={:#010x}) = {got:#x}, want {want:#x}",
+            inp[0], inp[3],
+        );
+    });
 }

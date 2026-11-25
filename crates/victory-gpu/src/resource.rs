@@ -1390,9 +1390,23 @@ pub(crate) fn room() -> bool {
         return true;
     }
     match crate::host::host().and_then(|h| h.video_memory()) {
-        Some([budget, used, ..]) => used < budget / 100 * room_percent(),
+        // (less what is kept for copies of title buffers not made yet,
+        // `shadow::card_reserve`)
+        Some([budget, used, ..]) => under_share(budget, used, crate::shadow::card_reserve(), room_percent()),
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+/// Whether the card's memory in use, with `reserve` bytes kept for copies
+/// of title buffers not made yet, is under `percent` of `budget` ([`room`]).
+fn under_share(budget: u64, used: u64, reserve: u64, percent: u64) -> bool {
+    used.saturating_add(reserve) < budget / 100 * percent
+}
+
+/// [`room`]'s share of the card's budget, in percent.
+#[cfg(windows)]
+pub(crate) fn room_share() -> u64 {
+    room_percent()
 }
 
 /// The share of the card's budget, in percent, up to which host copies of
@@ -2733,6 +2747,20 @@ pub(crate) fn test_buffer(width: u64) -> This {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_reserve_for_card_copies_counts_as_used() {
+        const MB: u64 = 1 << 20;
+        let budget = 10_000 * MB;
+        // 8.5 GB in use, the textures' share 90%: room, without the reserve.
+        assert!(super::under_share(budget, 8_500 * MB, 0, 90));
+        // A gigabyte kept for card copies not made yet: no room for textures.
+        assert!(!super::under_share(budget, 8_500 * MB, 1_024 * MB, 90));
+        // Once the copies are made (reserve spent), room again.
+        assert!(super::under_share(budget, 8_500 * MB, 0, 90));
+        // No overflow at the edges.
+        assert!(!super::under_share(budget, u64::MAX, u64::MAX, 90));
+    }
+
     use super::*;
     use crate::object::slot;
 

@@ -638,7 +638,17 @@ impl Rig {
             if WaitForSingleObject(self.event, 10_000).0 != 0 {
                 return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL));
             }
-            self.device.GetDeviceRemovedReason()
+            // Release the list's and allocator's references to any buffers
+            // recorded in this run (such as a placed buffer whose heap the
+            // caller is about to drop before calling `VirtualFree`).
+            let status = self.device.GetDeviceRemovedReason();
+            if status.is_ok() {
+                let _ = self.allocator.Reset();
+                if self.list.Reset(&self.allocator, None).is_ok() {
+                    let _ = self.list.Close();
+                }
+            }
+            status
         }
     }
 
@@ -728,6 +738,32 @@ impl Rig {
             best = best.min(started.elapsed().as_secs_f64() * 1000.0);
         }
         Ok(best)
+    }
+}
+
+/// Calls `VirtualFree` on memory whose opened D3D12 heap was just dropped.
+/// While another command queue on the same D3D12 device is active (for
+/// instance parallel tests sharing the process-wide WARP device, or the
+/// game's queue during a probe), the runtime can defer the kernel unpin of
+/// a released `OpenExistingHeapFromAddress*` heap by a few milliseconds,
+/// during which `VirtualFree` returns `ERROR_INVALID_PARAMETER` (87). Retry
+/// briefly on that error only; any other error returns immediately.
+unsafe fn free_after_heap(at: *mut c_void, len: usize, flags: u32) -> bool {
+    const ERROR_INVALID_PARAMETER: u32 = 87;
+    let started = std::time::Instant::now();
+    loop {
+        // SAFETY: caller upholds `VirtualFree`'s contract for `(at, len, flags)`.
+        if unsafe { mem::VirtualFree(at, len, flags) } != 0 {
+            return true;
+        }
+        // SAFETY: thread-local Win32 error code.
+        let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        if err != ERROR_INVALID_PARAMETER
+            || started.elapsed() >= std::time::Duration::from_secs(1)
+        {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }
 
@@ -891,7 +927,7 @@ unsafe fn private(p: &mut Probe, rig: &mut Rig) {
             drop(placed);
         }
         drop(opened);
-        let freed = mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE) != 0;
+        let freed = free_after_heap(base.cast(), 0, mem::MEM_RELEASE);
         p.lines.push(format!("  released after the heap went: {freed}"));
     }
 }
@@ -994,7 +1030,7 @@ unsafe fn cost(p: &mut Probe, rig: &mut Rig, memory: &dyn Fn() -> Option<[u64; 4
                 ms(speed)
             ));
             drop((placed, opened));
-            mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+            free_after_heap(base.cast(), 0, mem::MEM_RELEASE);
         }
         let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
         let handle = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, (bytes as u64 >> 32) as u32, bytes as u32, std::ptr::null());
@@ -1466,12 +1502,28 @@ mod tests {
             assert!(same(start as *const u8, &got), "the GPU reads the title buffer's bytes");
             rig.store(&placed.buffer, placed.bias + 16, &[0xa5; 64]).unwrap();
             assert!(same((start + 16) as *const u8, &[0xa5; 64]), "the GPU's write is at the title's address");
+            drop(rig);
             drop(placed);
             // Half of it decommitted: turned down, the host not asked.
-            assert_ne!(mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT), 0);
+            assert!(
+                free_after_heap(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT),
+                "VirtualFree(MEM_DECOMMIT) failed with GetLastError={}",
+                windows_sys::Win32::Foundation::GetLastError()
+            );
             assert!(matches!(place_part(&device, start, len), Err(None)));
-            mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+            assert!(free_after_heap(base.cast(), 0, mem::MEM_RELEASE));
         }
+    }
+
+    /// `free_after_heap` retries only `ERROR_INVALID_PARAMETER` (87, a heap
+    /// still retiring); any other failure returns at once without waiting.
+    #[test]
+    fn free_after_heap_returns_immediately_on_other_errors() {
+        let started = std::time::Instant::now();
+        // SAFETY: `VirtualFree` rejects a null pointer with `ERROR_INVALID_ADDRESS`.
+        let freed = unsafe { free_after_heap(std::ptr::null_mut(), 0, mem::MEM_RELEASE) };
+        assert!(!freed);
+        assert!(started.elapsed() < std::time::Duration::from_millis(250));
     }
 
     /// The census names each kind of memory.

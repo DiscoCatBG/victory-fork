@@ -1223,11 +1223,12 @@ impl<'a> Tracer<'a> {
         for (j, &q) in preds.iter().enumerate() {
             let n = known.len();
             known.push((lanes.reach[q], true));
-            if let LaneExit::Branch {
-                when,
-                taken,
-                not_taken,
-            } = lanes.exits[q]
+            if !lanes.wide.contains(&q)
+                && let LaneExit::Branch {
+                    when,
+                    taken,
+                    not_taken,
+                } = lanes.exits[q]
                 && taken != not_taken
             {
                 known.push((when, taken == block));
@@ -1865,11 +1866,12 @@ impl<'a> Tracer<'a> {
         for (j, &q) in preds.iter().enumerate() {
             let n = known.len();
             known.push((lanes.reach[q], true));
-            if let LaneExit::Branch {
-                when,
-                taken,
-                not_taken,
-            } = lanes.exits[q]
+            if !lanes.wide.contains(&q)
+                && let LaneExit::Branch {
+                    when,
+                    taken,
+                    not_taken,
+                } = lanes.exits[q]
                 && taken != not_taken
             {
                 known.push((when, taken == block));
@@ -2112,13 +2114,11 @@ impl<'a> Tracer<'a> {
             }
             let mut found = false;
             for c in copies {
-                let Term::Value(c) = c else { continue };
-                let Some(site) = self.defs[c.0 as usize] else {
-                    continue;
-                };
+                let Term::Value(c) = c else { return None };
+                let site = self.defs[c.0 as usize]?;
                 let load = self.inst(site);
                 if !load.name().starts_with("s_load_") {
-                    continue;
+                    return None;
                 }
                 // Dword k of the operand is dword `first + k` of each load.
                 let dword = load.writes.iter().position(|x| x.1 == c)?;
@@ -2181,8 +2181,17 @@ impl<'a> Tracer<'a> {
                 continue;
             }
             // An entry value, or a number some instruction computed.
-            let Some(inst) = self.def(v) else { continue };
-            if inst.name().starts_with("global_load_") {
+            let Some(site) = self.defs[v.0 as usize] else {
+                continue;
+            };
+            let inst = self.inst(site);
+            if matches!(
+                inst.fields,
+                Fields::Flat { .. }
+                    | Fields::Buffer { .. }
+                    | Fields::Ds { .. }
+                    | Fields::Image { .. }
+            ) {
                 return false;
             }
             let Fields::Valu(f) = &inst.fields else {
@@ -2194,7 +2203,7 @@ impl<'a> Tracer<'a> {
                 _ => continue,
             };
             if f.abs != 0 || f.neg != 0 || f.sdwa.is_some() || f.dpp.is_some() {
-                continue;
+                return false;
             }
             for op in f.src.iter().take(sources) {
                 match *op {
@@ -2202,11 +2211,17 @@ impl<'a> Tracer<'a> {
                     Operand::Scalar { code, .. } if code != NULL => {
                         out.extend(inst.read(Reg::S(code)).map(|s| self.origin(s)));
                     }
-                    _ => {}
+                    Operand::Scalar { .. } | Operand::Const(_) | Operand::Literal(_) => {
+                        return false;
+                    }
+                    _ => return false,
                 }
             }
-            // Lanes outside EXEC keep the old value.
-            if let Some(Operand::Vector { reg, .. }) = f.dst {
+            // Lanes outside EXEC keep the old value; unguarded moves overwrite every reaching lane.
+            let guarded = self
+                .lanes
+                .is_none_or(|st| st.guards[site.0][site.1].is_some());
+            if guarded && let Some(Operand::Vector { reg, .. }) = f.dst {
                 work.extend(inst.read(Reg::V(reg)));
             }
         }
@@ -3844,5 +3859,154 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn wide_branch_does_not_drop_predecessor_edges_in_only_edge_or_lane_phi() {
+        // Block 0 narrows EXEC on v0 == 0 and jumps over block 1 (which loads
+        // descriptor s[4:7] at offset 0x20) when EXEC == 0. At the join
+        // (block 2), EXEC is restored and then re-narrowed to v0 == 0 before
+        // reading a buffer through s[4:7].
+        // - With per-lane branching (`wide = {}`), only block 1 can reach the
+        //   v0 == 0 use, so `only_edge` proves s[4:7] comes from block 1 (0x20).
+        // - With block 0 marked wave-wide (`wide = {0}`), every lane follows
+        //   the wave's branch together so block 0's skip edge (where s[4:7] was
+        //   never loaded) is NOT ruled out by `!(v0 == 0)`: `only_edge` returns
+        //   None and tracking rejects the uninitialized skip edge.
+        let words: &[u32] = &[
+            0xBE81_0380, // 0:  s_mov_b32 s1, 0
+            0xD4C2_0002,
+            0x0002_0080, // 4:  v_cmp_eq_u32 s2, 0, v0
+            0xBE83_3C02, // 12: s_and_saveexec_b32 s3, s2
+            0xBF88_0002, // 16: s_cbranch_execz +2 (-> 28)
+            0xF408_0100,
+            0xFA00_0020, // 20: s_load_dwordx4 s[4:7], s[0:1], 0x20
+            0xBEFE_0303, // 28: s_mov_b32 exec_lo, s3
+            0xBEFE_0302, // 32: s_mov_b32 exec_lo, s2
+            0xBF88_0002, // 36: s_cbranch_execz +2 (-> 48) (so block 3 has reach == s2)
+            0xE030_0000,
+            0x8001_0000, // 40: buffer_load_dword v0, off, s[4:7], 0
+            S_ENDPGM,    // 48: s_endpgm
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let layout = [param(Table, 0, 1)];
+
+        // Per-lane branch: `only_edge` proves only the 0x20 edge reaches the read.
+        let per_lane = crate::structure::structure(&p).unwrap();
+        let r_lane = track(&p, &layout, HwStage::Cs, Some(&per_lane)).unwrap();
+        assert_eq!(r_lane.descriptors.len(), 1);
+        assert!(
+            matches!(r_lane.descriptors[0].source, Source::Loaded { .. }),
+            "per-lane branch should collapse to single loaded edge, got {:?}",
+            r_lane.descriptors[0].source
+        );
+        assert_eq!(table_offset(&r_lane, &r_lane.descriptors[0].source), 0x20);
+
+        // Wave-wide branch at block 0: must NOT prune block 0's skip edge via `only_edge`.
+        let wide = std::collections::HashSet::from([0usize]);
+        let st_wide = crate::structure::structure_wide(&p, &wide).unwrap();
+        assert!(
+            track(&p, &layout, HwStage::Cs, Some(&st_wide)).is_err(),
+            "wave-wide branch must not collapse through only_edge when skip edge is unloaded"
+        );
+
+        // Also check `lane_phi`: with `WATERFALL_JOINED_WAVE32`'s initial branch
+        // marked wave-wide, the skip edge into block 0x70 is NOT pruned as
+        // impossible, so tracing rejects the uninitialized input VGPRs on that
+        // edge instead of silently turning it into `None` (heap index 0).
+        let wf_code: Vec<u8> = WATERFALL_JOINED_WAVE32
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let wf_p = crate::ir::build(&wf_code, false, 256).unwrap();
+        let wf_layout = [param(Table, 0, 1), param(Table, 1, 1)];
+        let wf_wide = crate::structure::structure_wide(&wf_p, &wide).unwrap();
+        assert!(
+            track(&wf_p, &wf_layout, HwStage::Cs, Some(&wf_wide)).is_err(),
+            "wide branch must not prune the live skip edge in lane_phi"
+        );
+    }
+
+    #[test]
+    fn lane_copies_refuses_mixed_lds_constant_or_non_sload_arms() {
+        // Selecting per lane between a null constant descriptor (0) and an s_load
+        // descriptor must not collapse to Source::Loaded and bypass waterfall tracking.
+        let mut words_const = vec![
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0001,
+            0xFA00_0000, // s_load_dwordx4 s[0:3], s[2:3], null
+            0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+        ];
+        // v_cndmask_b32 v[10..13], 0, s[0..3], vcc_lo (VOP3: src0=128 (0), src1=k, src2=106 (vcc))
+        for k in 0..4u32 {
+            words_const.push(0xD501_0000 | (10 + k));
+            words_const.push(128 | (k << 9) | (106 << 18));
+        }
+        words_const.extend((0..4).map(|k| 0x7E00_0400 | (16 + k) << 17 | (0x100 + 10 + k)));
+        words_const.extend([
+            0xE030_1000,
+            0x8004_0D06, // buffer_load_dword v13, v6, s[16:19], 0 offen
+            S_ENDPGM,
+        ]);
+        let code: Vec<u8> = words_const.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        // No waterfall loop around the buffer_load, so per_lane/waterfall must refuse
+        // instead of lane_copies silently collapsing it to Source::Loaded.
+        assert!(track(&p, &[param(Table, 9, 1)], HwStage::Ps, Some(&st)).is_err());
+
+        // Selecting per lane between an entry SGPR (not s_load_) and an s_load descriptor
+        // must also not collapse to Source::Loaded.
+        let mut words_entry = vec![
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0001,
+            0xFA00_0000, // s_load_dwordx4 s[0:3], s[2:3], null
+            0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+        ];
+        // v_cndmask_b32 v[10..13], s[4..7], s[0..3], vcc_lo (s[4..7] are entry SGPRs)
+        for k in 0..4u32 {
+            words_entry.push(0xD501_0000 | (10 + k));
+            words_entry.push((4 + k) | (k << 9) | (106 << 18));
+        }
+        words_entry.extend((0..4).map(|k| 0x7E00_0400 | (16 + k) << 17 | (0x100 + 10 + k)));
+        words_entry.extend([
+            0xE030_1000,
+            0x8004_0D06, // buffer_load_dword v13, v6, s[16:19], 0 offen
+            S_ENDPGM,
+        ]);
+        let code: Vec<u8> = words_entry.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        assert!(track(&p, &[param(Table, 9, 1)], HwStage::Ps, Some(&st)).is_err());
+
+        // Selecting per lane between ds_read_b128 (LDS) and an s_load descriptor must
+        // refuse the LDS read rather than letting lane_copies ignore ds_read_b128.
+        let mut words_lds = vec![
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0001,
+            0xFA00_0000, // s_load_dwordx4 s[0:3], s[2:3], null
+            0xDBFC_0000,
+            0x0400_0001, // ds_read_b128 v[4:7], v1
+            0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+        ];
+        // v_cndmask_b32 v[10..13], v[4..7], s[0..3], vcc_lo
+        for k in 0..4u32 {
+            words_lds.push(0xD501_0000 | (10 + k));
+            words_lds.push((256 + 4 + k) | (k << 9) | (106 << 18));
+        }
+        words_lds.extend((0..4).map(|k| 0x7E00_0400 | (16 + k) << 17 | (0x100 + 10 + k)));
+        words_lds.extend([
+            0xE030_1000,
+            0x8004_0D06, // buffer_load_dword v13, v6, s[16:19], 0 offen
+            S_ENDPGM,
+        ]);
+        let code: Vec<u8> = words_lds.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        assert!(track(&p, &[param(Table, 9, 1)], HwStage::Ps, Some(&st)).is_err());
     }
 }

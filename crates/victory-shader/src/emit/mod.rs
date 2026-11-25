@@ -182,7 +182,8 @@ pub fn group_sync() -> u8 {
 ///   and identities, 4 one instruction for one value, 8 what a branch taken
 ///   says about its condition, 16 one read for one place within a block,
 ///   32 a first-lane read of two host waves without the round that asks
-///   which half has a lane (where every lane has one).
+///   which half has a lane (where every lane has one), 64 merge
+///   single-predecessor blocks.
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
@@ -703,11 +704,22 @@ fn emit_program(
     let pixel = native.stage == HwStage::Ps;
     let mut inputs = sig(FourCC::ISG1)?;
     let mut outputs = sig(FourCC::OSG1)?;
-    // Interpolation as DXC declares it by default; pixel inputs that are
-    // read get the mode their barycentrics say.
+    // Interpolation as the console container's PSV0 declares it, falling back
+    // to DXC's defaults when no PSV0 is present; pixel inputs that are read
+    // also get the mode their barycentrics say.
+    let psv_modes = c
+        .part(FourCC::PSV0)
+        .and_then(|p| psv_interps(p.data, pixel));
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
     for e in interpolated {
-        e.interp = match (e.kind, e.comp) {
+        let from_psv = psv_modes.as_ref().and_then(|m| {
+            let key = match e.row {
+                Some(r) => (true, r, e.col, 0),
+                None => (false, 0, 0, e.kind),
+            };
+            m.get(&key).copied().filter(|&mode| mode != 0)
+        });
+        e.interp = from_psv.unwrap_or(match (e.kind, e.comp) {
             (3, _) => 4,
             // Constant, as DXC declares it (the AMD compiler crashed on a
             // front face without a mode).
@@ -717,13 +729,15 @@ fn emit_program(
             (0 | 6 | 7, 9) => 2,
             (0, _) => 1,
             _ => 0,
-        };
+        });
     }
     // With a conservative depth output (SV_DepthLessEqual, GreaterEqual) DXIL
     // wants the position centroid (or per sample), as DXC declares it then.
     if pixel && outputs.iter().any(|e| matches!(e.kind, 18 | 19)) {
         for e in inputs.iter_mut().filter(|e| e.kind == 3) {
-            e.interp = 5;
+            if !matches!(e.interp, 5 | 7) {
+                e.interp = 5;
+            }
         }
     }
     // The modes the title's compiler declared (its `PSV0`) come first:
@@ -814,6 +828,57 @@ fn emit_program(
         root_indexed_views: res.root_indexed_views.clone(),
     };
     Ok((shader, wave_size))
+}
+
+/// Per-element interpolation modes from a console container's `PSV0` part,
+/// keyed by `(allocated, row, col, unallocated_kind)`.
+fn psv_interps(
+    d: &[u8],
+    inputs: bool,
+) -> Option<std::collections::HashMap<(bool, u32, u8, u8), u8>> {
+    use crate::dxbc::u32_at;
+    let info_sz = u32_at(d, 0).ok()? as usize;
+    if info_sz < 36 || 4 + info_sz > d.len() {
+        return None;
+    }
+    let in_el = usize::from(*d.get(4 + 28)?);
+    let out_el = usize::from(*d.get(4 + 29)?);
+    let mut pos = 4 + info_sz;
+    let res_cnt = u32_at(d, pos).ok()? as usize;
+    pos += 4;
+    if res_cnt > 0 {
+        let res_sz = u32_at(d, pos).ok()? as usize;
+        pos = pos.checked_add(4)?.checked_add(res_cnt.checked_mul(res_sz)?)?;
+    }
+    let str_len = u32_at(d, pos).ok()? as usize;
+    pos = pos.checked_add(4)?.checked_add(str_len)?;
+    let idx_cnt = u32_at(d, pos).ok()? as usize;
+    pos = pos.checked_add(4)?.checked_add(idx_cnt.checked_mul(4)?)?;
+    if pos >= d.len() {
+        return Some(std::collections::HashMap::new());
+    }
+    let el_sz = u32_at(d, pos).ok()? as usize;
+    pos += 4;
+    if el_sz < 14 {
+        return None;
+    }
+    let (start, count) = if inputs { (0, in_el) } else { (in_el, out_el) };
+    let end = start.checked_add(count)?;
+    if pos.checked_add(end.checked_mul(el_sz)?)? > d.len() {
+        return None;
+    }
+    let mut out = std::collections::HashMap::with_capacity(count);
+    for k in start..end {
+        let e = &d[pos + k * el_sz..pos + (k + 1) * el_sz];
+        let alloc = e[10] >> 6 & 1 != 0;
+        let key = if alloc {
+            (true, u32::from(e[9]), (e[10] >> 4) & 3, 0)
+        } else {
+            (false, 0, 0, e[11])
+        };
+        out.insert(key, e[13]);
+    }
+    Some(out)
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
@@ -1214,6 +1279,33 @@ mod tests {
     fn a_backward_permute_reads_the_lane_its_address_names() {
         // v_mov_b32 v2, 11; ds_bpermute_b32 v1, v0, v2
         stores_v1(&[0x7E04_028B, 0xDACC_0000, 0x0100_0200]).unwrap();
+    }
+
+    /// `ds_permute_b32` scatters through the console's zero-initialized
+    /// scratch: each lane gives its data register to the lane its address
+    /// names, within the calling lane's 32-lane half, and reads the slot of
+    /// its own name. It stopped as "an LDS operation".
+    #[test]
+    fn a_scatter_permute_writes_the_lane_its_address_names() {
+        // v_mov_b32 v2, 11; ds_permute_b32 v1, v0, v2
+        stores_v1(&[0x7E04_028B, 0xDAC8_0000, 0x0100_0200]).unwrap();
+    }
+
+    /// The scatter's barriers need every lane of the group: in a branch
+    /// this refuses (a wave-wide structuring of the block would open it).
+    #[test]
+    fn a_scatter_permute_in_a_branch_is_refused() {
+        let body = [
+            0x7E04_028B, // v_mov_b32 v2, 11
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBE82_376A, // s_andn1_saveexec_b64 s[2:3], vcc
+            0xBF88_0002, // s_cbranch_execz 2
+            0xDAC8_0000, // ds_permute_b32 v1, v0, v2
+            0x0100_0200,
+            0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+        ];
+        let e = stores_v1(&body).unwrap_err().to_string();
+        assert!(e.contains("a scatter permute in a branch"), "{e}");
     }
 
     /// A carry-in reading a join of compares after a divergent branch. A
@@ -1856,6 +1948,149 @@ mod tests {
             assert_eq!(out[0][14], f32::NEG_INFINITY.to_bits(), "warp={warp} -1e38/1e-38");
         }
     }
+
+    /// A structured buffer accessed with `idxen` and whose record count
+    /// (descriptor dword 2) is read as data: `victory-gpu` backs structured
+    /// views with raw views (`raw_window`), so `getDimensions` must query a
+    /// raw handle and divide bytes by `stride`.
+    #[test]
+    fn structured_buffer_record_count_matches_raw_host_view() {
+        let words: &[u32] = &[
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+            0x7E04_020A, // v_mov_b32 v2, s10
+            0x340E_0083, // v_lshlrev_b32 v7, 3, v0
+            0xE074_1000,
+            0x8003_0107, // buffer_store_dwordx2 v[1:2], v7, s[12:15], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                crate::RootParam {
+                    root: crate::RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![
+                crate::UsedResource {
+                    kind: crate::ResourceType::Srv,
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 16,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+                crate::UsedResource {
+                    kind: crate::ResourceType::Uav,
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 8,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [4, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let l = super::lower::lower(&super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        let mut dxil = l.dxil;
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxil).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let _one = super::valu_tests::ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let cs = super::HostShader {
+                stage: super::HwStage::Cs,
+                dxil,
+                user_data: l.user_data,
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: l.root_cbvs,
+                root_srvs: l.root_srvs,
+                root_uavs: l.root_uavs,
+                root_indexed_views: Vec::new(),
+            };
+            // 32 dwords = 128 bytes = 8 elements of stride 16.
+            let data: Vec<u32> = (0..32).map(|i| 1000 + i).collect();
+            for (label, warp) in [("hardware", false), ("warp", true)] {
+                let Ok(host) = super::host::Host::new(warp) else {
+                    continue;
+                };
+                let (root, pso) = host.compute_pipeline(&cs).unwrap();
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &super::host::Dispatch {
+                            roots: vec![(0, super::host::Root::Constants(vec![0, 0, 0, 0, 0]))],
+                            views: &[
+                                super::host::View::Buffer {
+                                    data: &data,
+                                    stride: super::host::Stride::Raw,
+                                },
+                                super::host::View::RawUav(16),
+                            ],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                // Lane k reads dword 0 of element k (1000 + 4*k) and record count 8.
+                for k in 0..4usize {
+                    assert_eq!(out[0][2 * k], 1000 + (4 * k) as u32, "{label} lane {k} data");
+                    assert_eq!(out[0][2 * k + 1], 8, "{label} lane {k} record count");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2211,6 +2446,139 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    #[test]
+    fn console_psv_interpolation_modes_are_preserved_for_copacked_inputs() {
+        // A float input co-packed in row 0 alongside a uint input must keep
+        // the console PSV0's Constant (1) mode instead of defaulting to Linear
+        // (2), which DXIL validator 1.6 rejects when mixed in one register.
+        let words = [
+            0xC80E_0000u32, // v_interp_mov_f32 v0, p0, attr0.x
+            0xF800_180F,
+            0x0000_0000, // exp mrt0, v0, v0, v0, v0 done vm
+            0xBF81_0000,
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Ps {
+                inputs: vec![crate::native::PsInput {
+                    usage: crate::native::Usage::Generic,
+                    row: 0,
+                    mask: 0b11,
+                    attr: 0,
+                    flat: true,
+                    fp16: false,
+                    pack2: false,
+                    row2: 0,
+                }],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let f_flat = SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 1,
+            row: Some(0),
+            col: 0,
+            cols: 1,
+            usage: 1,
+            half: false,
+            packed: false,
+        };
+        let u_flat = SigElement {
+            name: "TEXCOORD".into(),
+            index: 1,
+            kind: 0,
+            comp: 5,
+            interp: 1,
+            row: Some(0),
+            col: 1,
+            cols: 1,
+            usage: 0,
+            half: false,
+            packed: false,
+        };
+        let target = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+            packed: false,
+        };
+        let isg1 = super::container::signature(&[f_flat.clone(), u_flat.clone()], true);
+        let osg1 = super::container::signature(std::slice::from_ref(&target), false);
+        let psv0 = super::container::psv(&super::container::Psv {
+            stage: 0,
+            flag: false,
+            inputs: &[f_flat, u_flat],
+            outputs: &[target],
+            prims: &[],
+            mesh: None,
+            bindings: &[],
+            threads: [0; 3],
+            wave_size: None,
+            geometry: None,
+        });
+        let bytes = crate::dxbc::build(&[
+            (super::FourCC::ISG1, &isg1),
+            (super::FourCC::OSG1, &osg1),
+            (super::FourCC::PSV0, &psv0),
+        ]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let host = super::Container::parse(&out.dxil).unwrap();
+        let modes = super::psv_interps(host.part(super::FourCC::PSV0).unwrap().data, true).unwrap();
+        assert_eq!(modes.get(&(true, 0, 0, 0)), Some(&1));
+        assert_eq!(modes.get(&(true, 0, 1, 0)), Some(&1));
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+    }
+
+    /// A dead interpolated channel removed by `bitcode::opt` must not remain
+    /// marked read in `ISG1` (the DXIL validator checks the input signature
+    /// against the surviving `loadInput` / `attributeAtVertex` calls).
+    #[test]
+    fn dead_input_read_is_cleared_from_isg1_after_opt() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            0xC810_0100, // v_interp_p1_f32 v4, v0, attr0.y (dead)
+            0xC811_0101, // v_interp_p2_f32 v4, v1, attr0.y (dead)
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        let host = Container::parse(&shader.dxil).unwrap();
+        let isg1 = host.part(FourCC::ISG1).unwrap().data;
+        // Row 0's ReadWriteMask byte is at offset 8 (header) + 25.
+        assert_eq!(isg1[8 + 25], 0x1, "dead .y channel left in ISG1 rw mask");
+        validate(&shader);
     }
 }
 

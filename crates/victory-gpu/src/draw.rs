@@ -74,7 +74,7 @@ thread_local! {
 
 /// The milliseconds of every frame the pass that uploads textures picked
 /// by index takes before a shader that picks by index has asked for it
-/// (`VICTORY_EARLY_TEXTURES_MS`, 12; 0: never, as before), and the
+/// (`VICTORY_EARLY_TEXTURES_MS`, 0: never, the default; 12 as it was), and the
 /// milliseconds it may take just before a draw of the title's decoration
 /// bake (`VICTORY_BAKE_TEXTURES_MS`, 1500; 0: nothing special).
 ///
@@ -91,7 +91,7 @@ fn early_budgets() -> (u64, u64) {
         let ms = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
         };
-        (ms("VICTORY_EARLY_TEXTURES_MS", 12), ms("VICTORY_BAKE_TEXTURES_MS", 1500))
+        (ms("VICTORY_EARLY_TEXTURES_MS", 0), ms("VICTORY_BAKE_TEXTURES_MS", 1500))
     })
 }
 
@@ -2064,15 +2064,16 @@ impl State {
             // may fill the texture's memory itself only afterwards, with
             // no descriptor write and nothing from the runtime to tell of
             // it. The host copy then kept what the memory held at the
-            // first look for the rest of the run. The look reads 48 KiB;
+            // first look for the rest of the run. The look reads 48 KiB and
+            // the start of each mip of each slice (`texture::fingerprint`);
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
-            if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+            if let Some(((at, len, print, looks, uploaded), mips)) = host.texture_slot_checked(index) {
+                if crate::texture::fingerprint(at, len, mips.as_deref().unwrap_or_default()) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
+                            host.texture_slot_recheck(index, write, frame + wait, (at, len), mips, print, looks + 1, uploaded)
                         }
                         None => host.texture_slot_done(index, write, None),
                     }
@@ -2228,9 +2229,9 @@ impl State {
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
             match memory {
                 // Whole and uploaded: looked at again (see above).
-                Some((at, len)) => {
-                    let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
+                Some((at, len, mips)) => {
+                    let print = crate::texture::fingerprint(at, len, mips.as_deref().unwrap_or_default());
+                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), mips, print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),
             }

@@ -837,9 +837,28 @@ impl<'a> Lanes<'a> {
             }
         }
         self.masks.retain(|k, _| !split.contains(&k.0));
-        self.active.retain(|lo| !split.contains(lo));
+        let masks: HashMap<Value, Bool> = self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect();
+        // A mask is only safe to ballot at its defining block when every lane
+        // whose bit can be set in `m` actually reaches that block (`m => cond[b]`).
+        // Masks written after EXEC was widened inside a divergent block (e.g.
+        // restoring a saved EXEC mask or a compare under widened EXEC) can hold
+        // bits for inactive lanes and must not stay in `active`.
+        self.active.retain(|lo| {
+            let Some(&m) = masks.get(lo) else {
+                return false;
+            };
+            let def_block = self
+                .defs
+                .get(lo)
+                .map(|&(b, _)| b)
+                .or_else(|| self.phis.get(lo).map(|&(b, _)| b));
+            match def_block {
+                None => true,
+                Some(block) => self.b.implies(m, cond[block]),
+            }
+        });
         Ok(Structured {
-            masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
+            masks,
             highs: self
                 .masks
                 .keys()
@@ -881,6 +900,36 @@ impl<'a> Lanes<'a> {
         }
     }
 
+    /// The source pair of two adjacent dword moves in one block.
+    fn moved_pair(&self, k: Key) -> Option<Key> {
+        let moved = |v| {
+            let &(b, i) = self.defs.get(&v)?;
+            let inst = &self.p.blocks[b].insts[i];
+            if inst.name() != "s_mov_b32" {
+                return None;
+            }
+            let Fields::Sop {
+                dst: Some(Operand::Scalar { code: dst, .. }),
+                src,
+                ..
+            } = &inst.fields
+            else {
+                return None;
+            };
+            let [Operand::Scalar { code: src, .. }] = src.as_slice() else {
+                return None;
+            };
+            if inst.write(Reg::S(*dst)) != Some(v) {
+                return None;
+            }
+            Some((b, *dst, *src, inst.read(Reg::S(*src))?))
+        };
+        let (lb, ld, ls, lv) = moved(k.0)?;
+        let (hb, hd, hs, hv) = moved(k.1)?;
+        (lb == hb && ld.checked_add(1) == Some(hd) && ls.checked_add(1) == Some(hs))
+            .then_some((lv, hv))
+    }
+
     fn exec(&mut self, inst: &Inst) -> Bool {
         match self.key(|r| inst.read(r), EXEC) {
             Some(k) => self.mask(k).0,
@@ -903,26 +952,37 @@ impl<'a> Lanes<'a> {
             None => {
                 let (lo, hi) = (self.defs.get(&k.0).copied(), self.defs.get(&k.1).copied());
                 let def = |d: Option<(usize, usize)>| d.map(|(b, i)| &p.blocks[b].insts[i]);
-                let m = match (lo, hi) {
-                    (Some(at), Some(hi)) if at == hi => def(lo)
-                        .and_then(|i| self.sop(i))
-                        .and_then(|r| r.dst)
-                        .map(|d| d.1),
-                    _ => None,
-                };
                 // What an EXEC write the pass does not follow leaves there.
                 let exec_write = |d: Option<(usize, usize)>, v: Value| {
                     def(d).is_some_and(|i| {
                         i.write(Reg::S(EXEC)) == Some(v) || i.write(Reg::S(EXEC + 1)) == Some(v)
                     })
                 };
-                let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
+                let (m, derived) = match (lo, hi) {
+                    (Some(at), Some(hi)) if at == hi => {
+                        let m = def(lo)
+                            .and_then(|i| self.sop(i))
+                            .and_then(|r| r.dst)
+                            .map(|d| d.1);
+                        (m, exec_write(lo, k.0) || exec_write(Some(hi), k.1))
+                    }
+                    _ => {
+                        let copied = self.moved_pair(k).and_then(|source| {
+                            let (m, derived) = self.mask(source);
+                            self.b
+                                .support(m)
+                                .iter()
+                                .all(|a| !matches!(a, Atom::Opaque(_)))
+                                .then_some((m, derived))
+                        });
+                        copied.map_or_else(
+                            || (None, exec_write(lo, k.0) || exec_write(hi, k.1)),
+                            |(m, derived)| (Some(m), derived),
+                        )
+                    }
+                };
                 // shortcut: the atom names the pair by its low dword, and
-                // lowering takes the high dword written beside it. For halves
-                // written apart (two `s_mov_b32`) lanes 32-63 are wrong unless
-                // lowering has no value for the low dword (EXEC, compares)
-                // and refuses. Give the atom both dwords when such code
-                // turns up.
+                // lowering takes the high dword written beside it.
                 let m = m.unwrap_or_else(|| {
                     let born = self.born(k.0);
                     self.b.atom(Atom::Opaque(k.0), born)
@@ -1691,6 +1751,47 @@ mod tests {
     }
 
     #[test]
+    fn paired_dword_moves_keep_exec_mask_provenance() {
+        let p = build(
+            &[
+                0xBE82_047E, // s_mov_b64 s[2:3], exec
+                0xBE84_0302, // s_mov_b32 s4, s2
+                0xBE85_0303, // s_mov_b32 s5, s3
+                0xBE86_0304, // s_mov_b32 s6, s4
+                0xBE87_0305, // s_mov_b32 s7, s5
+                0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        assert_eq!(guarded(&s), 0, "{:?}", s.guards);
+    }
+
+    #[test]
+    fn paired_dword_moves_do_not_make_unknown_values_into_masks() {
+        let p = build(
+            &[
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0301, // s_mov_b32 s5, s1
+                0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let guard = s.guards[0][3].expect("unknown mask still guards the vector op");
+        assert!(
+            s.bools
+                .support(guard)
+                .iter()
+                .any(|a| matches!(a, Atom::Opaque(_)))
+        );
+    }
+
+    #[test]
     fn a_mask_joined_over_a_back_edge_with_a_rewritten_high_dword_is_not_the_compare() {
         let p = build(
             &[
@@ -1844,5 +1945,50 @@ mod tests {
                 .any(|&e| matches!(s.bools.support(e)[..], [Atom::Lane(_)])),
             "{edges:?}"
         );
+    }
+
+    #[test]
+    fn widened_exec_inside_divergent_branch_is_not_active() {
+        // Block 0 narrows EXEC with v_cmp_eq_u32 + s_and_saveexec_b32 and
+        // branches over block 1 when EXEC is zero. Inside divergent block 1
+        // (cond[1] == vcc), EXEC is widened back to the saved full mask,
+        // copied to s4, and used for a VALU compare into s6. None of those
+        // block-1 masks imply cond[1], so none may stay in `active`.
+        let p = build(
+            &[
+                0xD4C2_0002,
+                0x0002_0080, // 0:  v_cmp_eq_u32 s2, 0, v0
+                0xBE80_3C02, // 8:  s_and_saveexec_b32 s0, s2
+                0xBF88_0004, // 12: s_cbranch_execz +4 (-> 32)
+                0xBEFE_0300, // 16: s_mov_b32 exec_lo, s0 (widens EXEC inside divergent block 1)
+                0xBE84_037E, // 20: s_mov_b32 s4, exec_lo
+                0xD4CA_0006,
+                0x0002_0280, // 24: v_cmp_ne_u32 s6, 0, v1 (under widened EXEC)
+                S_ENDPGM,    // 32: s_endpgm
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+
+        let s2_val = p.blocks[0].insts[0].write(Reg::S(2)).unwrap();
+        assert!(s.masks.contains_key(&s2_val));
+        assert!(s.active.contains(&s2_val), "block-0 compare is active");
+
+        let b1 = p.blocks.iter().find(|b| b.offset == 16).expect("block 1");
+        let restored_exec = b1.insts[0].write(Reg::S(EXEC)).unwrap();
+        let copied_s4 = b1.insts[1].write(Reg::S(4)).unwrap();
+        let cmp_s6 = b1.insts[2].write(Reg::S(6)).unwrap();
+
+        for (label, val) in [
+            ("restored exec", restored_exec),
+            ("copy of widened exec", copied_s4),
+            ("v_cmp under widened exec", cmp_s6),
+        ] {
+            assert!(s.masks.contains_key(&val), "{label} tracked in masks");
+            assert!(
+                !s.active.contains(&val),
+                "{label} must not be in active (its bits include lanes not executing block 1)"
+            );
+        }
     }
 }
