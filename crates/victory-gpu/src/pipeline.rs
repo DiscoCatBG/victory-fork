@@ -346,7 +346,28 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 #[cfg(windows)]
 pub(crate) fn builder_quarantined(this: This) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+    is_builder(this)
+        && (*ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1")) || in_warmup())
+}
+
+/// The frame the builder first ran in (0: not yet).
+#[cfg(windows)]
+static BUILDER_FROM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `VICTORY_BVH_WARMUP=<frames>` (opt-in): for that many frames after the
+/// builder first runs, it runs quarantined (nothing its lists write
+/// reaches title memory): its first frames reach pages through pointers
+/// that have no copy yet, so its results then are not the title's
+/// (fxceless/victory-fork#935; PalmVIDev 46da86a0, whose author's run went
+/// 74 s with the builder on where it crashed within seconds before).
+#[cfg(windows)]
+fn in_warmup() -> bool {
+    static FRAMES: OnceLock<u64> = OnceLock::new();
+    let frames = *FRAMES.get_or_init(|| {
+        std::env::var("VICTORY_BVH_WARMUP").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    });
+    let from = BUILDER_FROM.load(std::sync::atomic::Ordering::Relaxed);
+    frames > 0 && (from == 0 || crate::frame::current() < from + frames)
 }
 
 /// Whether what the structure builder's stages store into title memory
@@ -547,6 +568,7 @@ pub(crate) fn builder_runs(this: Option<This>) -> bool {
         b.whole = true;
         b.partial = missing > 0;
         BUILDER_LIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        BUILDER_FROM.store(crate::frame::current(), std::sync::atomic::Ordering::Relaxed);
     }
     if b.partial && this.is_some_and(|this| !make::now(&pipeline(this).host)) {
         b.off = true;

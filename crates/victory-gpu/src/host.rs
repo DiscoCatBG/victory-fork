@@ -2035,6 +2035,13 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// `VICTORY_BVH_QUARANTINE` (or the builder's warm-up): the list records
+    /// a stage of the structure builder, so nothing its shaders write is
+    /// copied back into title memory. Copy-backs are declared per list, not
+    /// per dispatch: another shader's declaration in the same list covered
+    /// the builder's stores too, and the quarantine leaked
+    /// (fxceless/victory-fork#935).
+    quarantined: bool,
     /// Numbered title-memory copies (`crate::memory`) already refreshed /
     /// marked for shader write-back on this list since the last reset (or,
     /// for reads, since the last step that wrote title memory).
@@ -7106,10 +7113,26 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        {
+            let mut deferred = self.deferred();
+            if deferred.quarantined {
+                return;
+            }
+            deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+        }
         self.bump_hoist_mark();
+    }
+
+    /// The list records a quarantined stage of the structure builder
+    /// (`VICTORY_BVH_QUARANTINE`, `VICTORY_BVH_WARMUP`): no shader write of
+    /// the whole list is copied back into title memory, those declared
+    /// before it included.
+    pub(crate) fn quarantine(&self) {
+        let mut deferred = self.deferred();
+        if !deferred.quarantined {
+            deferred.quarantined = true;
+            deferred.copies.retain(|step| !matches!(step, Step::GpuWrite(..)));
+        }
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
