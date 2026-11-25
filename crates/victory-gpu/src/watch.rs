@@ -199,9 +199,13 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // once per flush: with one asking for the submission that was every
     // such range asked again at each of its 70 flushes (run 76: 2,300
     // askings a frame with the switch on, as without it). They are asked
-    // here, once; what is not write-watched stays with `writes`.
+    // here, once; what is not write-watched stays with `writes`. View
+    // memory the guards hold is not asked: the asking can only fail there
+    // (`known_view`), and `writes` answers it from the guards. Asked, it
+    // was some 4,000 failed kernel askings a frame on the submitting
+    // thread (main 5adccfe), one per guarded range at each submission.
     for &(start, end) in ranges {
-        if start >= end {
+        if start >= end || known_view(start) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
