@@ -2381,7 +2381,7 @@ fn flying() -> bool {
 /// CPU (the title's buffer copies, fills of upload memory, textures, or
 /// another host copy over the same bytes) and runs steps of ours that may
 /// read or write it anywhere; what the flights write is not there yet.
-fn late_blocked(runs: &[&HostList]) -> Option<usize> {
+fn late_blocked(runs: &[&HostList], forwarded: &[(usize, usize, usize)]) -> Option<usize> {
     let (written, by_copy, immed) = {
         let line = line();
         let immed = line.immed_writes();
@@ -2390,18 +2390,151 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
         }
         (line.written.clone(), line.by_copy.clone(), immed)
     };
-    blocked_by(&written, &by_copy, &immed, runs, true)
+    blocked_by(&written, &by_copy, &immed, runs, true, forwarded)
+}
+
+/// Whether a refresh of a host copy over bytes that another host copy's
+/// shaders write in a flight still in the air takes those bytes from that
+/// copy's buffer on the card, in queue order, instead of the submitting
+/// thread waiting for the flight to land (`VICTORY_ALIAS_FORWARD=0`: it
+/// waits, as before).
+///
+/// The wait (fxceless#191, "title memory read … another copy" on the line
+/// of flights) was about 3 settles and most of 66 ms a frame in the
+/// PalmVI run (main 5493624, RX 7900 XT), with the card about 40% busy
+/// while the submitting thread stood. The bytes are already on the card:
+/// the flight's submission comes first in the queue, so a copy recorded
+/// ahead of this submission's lists finds what its shaders wrote, as
+/// [`card_push`] passes what shaders wrote to card copies down in the
+/// submission that wrote it instead of fetching it afterwards.
+///
+/// Exact only where title memory over the range is still what the writing
+/// copy's snapshot took there (`Shadow::snapshot_is_title`): then the
+/// writing copy's buffer holds what title memory will hold once the flight
+/// is copied back. Anywhere else (the title wrote there since, a
+/// read-back, bottom-of-pipe writes, two writers, the refreshing copy's
+/// own shaders writing there too, a copy in the card's memory or in
+/// place), it waits as before.
+pub(crate) fn alias_forward() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_FORWARD").is_none_or(|v| v != "0"))
+}
+
+/// A range `[address, end)` of title memory that `from`'s shaders write in
+/// a flight, copied on the card from `from`'s buffer into `to`'s ahead of
+/// the submission's lists ([`alias_forward`]).
+struct Forward {
+    from: std::sync::Arc<crate::shadow::Shadow>,
+    to: std::sync::Arc<crate::shadow::Shadow>,
+    address: usize,
+    end: usize,
+}
+
+/// Since the last frame-rate line, of [`alias_forward`]: refreshes that
+/// took bytes on the card instead of waiting, ranges copied, their bytes,
+/// and refreshes that waited because the check refused them.
+static FORWARD_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// The most bytes of title memory a submission compares with snapshots to
+/// forward ([`alias_forward`]); past it, the rest waits.
+const FORWARD_CHECK_MOST: usize = 64 << 20;
+
+/// With flights in the air: the refreshes of `runs` that another copy's
+/// in-flight shader writes would block, and that can take those bytes on
+/// the card instead ([`alias_forward`]): the copies to make, and the
+/// refreshes (copy, address, end) that need not wait for them.
+fn plan_forwards(runs: &[&HostList]) -> (Vec<Forward>, Vec<(usize, usize, usize)>) {
+    use std::sync::Arc;
+    let mut forwards = Vec::new();
+    let mut freed = Vec::new();
+    if !alias_forward() || !late() {
+        return (forwards, freed);
+    }
+    let (written, by_copy, immed, owners) = {
+        let line = line();
+        if line.written.is_empty() {
+            return (forwards, freed);
+        }
+        let mut owners: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
+        for item in &line.line {
+            if let Late::Run(flight) = item {
+                for (shadow, _) in &flight.back {
+                    if !owners.iter().any(|s| Arc::ptr_eq(s, shadow)) {
+                        owners.push(shadow.clone());
+                    }
+                }
+            }
+        }
+        (line.written.clone(), line.by_copy.clone(), line.immed_writes(), owners)
+    };
+    let mut checked = 0usize;
+    for list in runs {
+        for step in &list.deferred().copies {
+            let Step::Refresh(to, address, len) = step else {
+                continue;
+            };
+            let (from, end) = (*address, *address + *len);
+            let copy = Arc::as_ptr(to) as usize;
+            if freed.contains(&(copy, from, end)) || !touches_other(&written, &by_copy, copy, from, end) {
+                continue;
+            }
+            let others: Vec<(usize, usize, usize)> =
+                by_copy.iter().copied().filter(|&(o, a, b)| o != copy && a < end && b > from).collect();
+            let owner = others[0].0;
+            let refused = touches(&immed, from, end)
+                || !to.plain()
+                // A read-back, or two writers.
+                || others.iter().any(|&(o, ..)| o == 0 || o != owner)
+                // The refreshing copy's own shaders write there too.
+                || by_copy.iter().any(|&(o, a, b)| o == copy && others.iter().any(|&(_, x, y)| x < b && y > a));
+            let writer = owners.iter().find(|s| Arc::as_ptr(s) as usize == owner);
+            let pieces: Vec<(usize, usize)> = others.iter().map(|&(_, a, b)| (a.max(from), b.min(end))).collect();
+            let bytes: usize = pieces.iter().map(|&(a, b)| b - a).sum();
+            let ok = !refused
+                && checked + bytes <= FORWARD_CHECK_MOST
+                && writer.is_some_and(|w| {
+                    let (ws, wl) = w.span();
+                    let (ts, tl) = to.span();
+                    w.plain()
+                        && pieces.iter().all(|&(a, b)| {
+                            (a as u64) >= ws.max(ts)
+                                && (b as u64) <= (ws + wl).min(ts + tl)
+                                && w.snapshot_is_title(a, b)
+                        })
+                });
+            checked += bytes;
+            let Some(writer) = writer.filter(|_| ok) else {
+                FORWARD_STATS[3].fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            FORWARD_STATS[0].fetch_add(1, Ordering::Relaxed);
+            for (a, b) in pieces {
+                FORWARD_STATS[1].fetch_add(1, Ordering::Relaxed);
+                FORWARD_STATS[2].fetch_add((b - a) as u64, Ordering::Relaxed);
+                forwards.push(Forward {
+                    from: writer.clone(),
+                    to: to.clone(),
+                    address: a,
+                    end: b,
+                });
+            }
+            freed.push((copy, from, end));
+        }
+    }
+    (forwards, freed)
 }
 
 /// [`late_blocked`] against `written` (joined), `by_copy` (per owner), and
 /// `immed` (bottom-of-pipe writes); `count` whether the kind of read is
-/// counted for the frame line.
+/// counted for the frame line; `forwarded` the refreshes (copy, address,
+/// end) that take the in-flight bytes on the card ([`plan_forwards`]).
 fn blocked_by(
     written: &[(usize, usize)],
     by_copy: &[(usize, usize, usize)],
     immed: &[(usize, usize)],
     runs: &[&HostList],
     count: bool,
+    forwarded: &[(usize, usize, usize)],
 ) -> Option<usize> {
     if written.is_empty() && immed.is_empty() {
         return None;
@@ -2438,6 +2571,9 @@ fn blocked_by(
                 Step::Refresh(shadow, address, len) => {
                     let (from, to) = (*address, *address + *len);
                     let copy = std::sync::Arc::as_ptr(shadow) as usize;
+                    if forwarded.contains(&(copy, from, to)) {
+                        continue;
+                    }
                     if touches_other(written, by_copy, copy, from, to) || touches(immed, from, to) {
                         if count {
                             LATE_STATS[18].fetch_add(1, Ordering::Relaxed);
@@ -2849,6 +2985,18 @@ fn late_line(frames: f64) {
         s[13],
         s[14],
     );
+    if alias_forward() {
+        let f: Vec<f64> = FORWARD_STATS.iter().map(|f| f.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "refreshes over another copy's in-flight shader writes, per frame: {:.1} took the bytes on the card ({:.1} ranges, {:.1} MB) \
+             instead of waiting, {:.1} waited (title wrote there since, no snapshot, a read-back, two writers, or a copy not plain; \
+             VICTORY_ALIAS_FORWARD=0: all wait)",
+            f[0],
+            f[1],
+            f[2] / 1048576.0,
+            f[3],
+        );
+    }
     {
         let w: Vec<f64> = LATE_WAITED.iter().map(|w| w.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames).collect();
         tracing::info!(
@@ -2887,6 +3035,69 @@ fn late_line(frames: f64) {
              {runs:.0} changed runs, {:.2} MB",
             bytes / (1 << 20) as f64
         );
+    }
+}
+
+#[cfg(test)]
+mod forward_tests {
+    use super::{Forward, host};
+    use std::sync::Arc;
+
+    /// The card copies a range of one copy's buffer into another's
+    /// ([`super::alias_forward`]), and nothing outside it; a snapshot is
+    /// title memory only where it holds the title's bytes.
+    #[test]
+    fn a_forward_takes_another_copys_bytes_on_the_card() {
+        let Some(host) = host() else {
+            eprintln!("no host GPU; skipped");
+            return;
+        };
+        const LEN: usize = 3 * 4096;
+        // The title memory both copies are of.
+        let title: Vec<u8> = (0..LEN).map(|i| (i % 7) as u8).collect();
+        let start = title.as_ptr() as usize;
+        let (a_buffer, a_data) = host.shared_buffer(LEN as u64).expect("a buffer");
+        let (b_buffer, b_data) = host.shared_buffer(LEN as u64).expect("a buffer");
+        // SAFETY: the mappings hold LEN bytes.
+        unsafe {
+            for i in 0..LEN {
+                *a_data.add(i) = (i % 251) as u8;
+            }
+            std::ptr::write_bytes(b_data, 0xEE, LEN);
+        }
+        // The writer's snapshot: the title's bytes, but for its last page.
+        let mut before = title.clone();
+        before[2 * 4096] ^= 1;
+        let a = Arc::new(crate::shadow::Shadow::for_test(a_buffer, a_data, start as u64, LEN as u64, Some(before)));
+        let b = Arc::new(crate::shadow::Shadow::for_test(b_buffer, b_data, start as u64, LEN as u64, None));
+        assert!(a.snapshot_is_title(start + 4096, start + 2 * 4096));
+        assert!(!a.snapshot_is_title(start + 4096, start + 3 * 4096));
+        assert!(!b.snapshot_is_title(start, start + 4096));
+        let forwards = [Forward {
+            from: a.clone(),
+            to: b.clone(),
+            address: start + 4096,
+            end: start + 2 * 4096,
+        }];
+        assert!(host.send_forwards(&forwards, u64::MAX));
+        // Wait for the card behind the copy.
+        // SAFETY: plain creation, signal and query.
+        unsafe {
+            let fence: windows::Win32::Graphics::Direct3D12::ID3D12Fence =
+                host.device.CreateFence(0, windows::Win32::Graphics::Direct3D12::D3D12_FENCE_FLAG_NONE).expect("a fence");
+            host.queue.Signal(&fence, 1).expect("signalled");
+            let waited = std::time::Instant::now();
+            while fence.GetCompletedValue() < 1 {
+                assert!(waited.elapsed() < std::time::Duration::from_secs(10), "the card did not finish");
+                std::thread::yield_now();
+            }
+        }
+        let got = b.bytes_for_test();
+        for (i, &byte) in got.iter().enumerate() {
+            let want = if (4096..2 * 4096).contains(&i) { (i % 251) as u8 } else { 0xEE };
+            assert_eq!(byte, want, "byte {i}");
+        }
+        drop(title);
     }
 }
 
@@ -3181,6 +3392,66 @@ impl Host {
     }
 
     /// An allocator and a closed list for a prelude.
+    /// Records and sends the copies of [`alias_forward`]: each range from
+    /// the writing copy's buffer into the refreshing copy's, on the card, in
+    /// a list of its own sent now (behind the flights whose shaders wrote
+    /// the bytes, ahead of the submission's lists). `done` is the fence
+    /// value signalled behind the submission: the list and both copies are
+    /// kept until the card has passed it. False if no list could be had.
+    fn send_forwards(&self, forwards: &[Forward], done: u64) -> bool {
+        type Kept = (u64, Prelude, Vec<std::sync::Arc<crate::shadow::Shadow>>);
+        struct Pool(Vec<Kept>);
+        // SAFETY: the lists and allocators are used by one submitting
+        // thread at a time (under the submission lock).
+        unsafe impl Send for Pool {}
+        static POOL: Mutex<Pool> = Mutex::new(Pool(Vec::new()));
+        // SAFETY: a plain query.
+        let passed = unsafe { self.fence.GetCompletedValue() };
+        let reused = {
+            let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+            // What the card has passed holds no copy any longer.
+            for kept in pool.0.iter_mut().filter(|k| k.0 <= passed) {
+                kept.2.clear();
+            }
+            let at = pool.0.iter().position(|k| k.0 <= passed);
+            at.map(|at| pool.0.swap_remove(at).1)
+        };
+        let Some(prelude) = reused.or_else(|| self.make_prelude()) else {
+            return false;
+        };
+        let (allocator, list) = &prelude;
+        // SAFETY: a list the card is done with; buffers of live copies
+        // (kept below until `done`), in the common state (promoted to the
+        // copy states for the list and back at its end).
+        let sent = unsafe {
+            (|| -> windows::core::Result<()> {
+                allocator.Reset()?;
+                list.Reset(allocator, None)?;
+                for f in forwards {
+                    let (from_start, _) = f.from.span();
+                    let (to_start, _) = f.to.span();
+                    list.CopyBufferRegion(
+                        &f.to.buffer,
+                        f.address as u64 - to_start,
+                        &f.from.buffer,
+                        f.address as u64 - from_start,
+                        (f.end - f.address) as u64,
+                    );
+                }
+                list.Close()?;
+                self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                Ok(())
+            })()
+        };
+        if let Err(e) = sent {
+            tracing::warn!(error = %e, "copies between host copies on the card not sent");
+            return false;
+        }
+        let held = forwards.iter().flat_map(|f| [f.from.clone(), f.to.clone()]).collect();
+        POOL.lock().unwrap_or_else(|e| e.into_inner()).0.push((done, prelude, held));
+        true
+    }
+
     fn make_prelude(&self) -> Option<Prelude> {
         // SAFETY: plain object creation.
         let made: windows::core::Result<Prelude> = unsafe {
@@ -4535,18 +4806,24 @@ impl Host {
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
+        // Refreshes over what another copy's shaders write in a flight take
+        // those bytes on the card ([`alias_forward`]) and need not wait.
+        let (mut forwards, forwarded) = if late { plan_forwards(runs) } else { (Vec::new(), Vec::new()) };
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
-        } else if let Some(why) = late_blocked(runs) {
+        } else if let Some(why) = late_blocked(runs, &forwarded) {
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
                 relay_wait(why, |line| {
                     let immed = line.immed_writes();
-                    blocked_by(&line.written, &line.by_copy, &immed, runs, false).is_none()
+                    blocked_by(&line.written, &line.by_copy, &immed, runs, false, &forwarded).is_none()
                 });
             } else {
+                // All landed: title memory has the flights' bytes, and the
+                // refreshes take them from there.
                 self.settle(&mut submitted, why);
+                forwards.clear();
             }
         }
         let behind = late && flying();
@@ -4650,6 +4927,19 @@ impl Host {
         let card = self.card_before(runs, flown);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
+        }
+        // The in-flight bytes the refreshes did not wait for, copied on the
+        // card ahead of the lists that read them (the refreshes on the CPU
+        // are done: these copies go over what they put there).
+        if !forwards.is_empty() && !self.send_forwards(&forwards, *submitted + 1) {
+            // No list to record them in: the flights land, and the bytes
+            // go from copy to copy on the CPU (the refreshes ran before).
+            let settling = std::time::Instant::now();
+            self.settle(&mut submitted, WHY_READ);
+            for f in &forwards {
+                f.to.take_from(&f.from, f.address, f.end);
+            }
+            settled += settling.elapsed();
         }
         let prepared = std::time::Instant::now();
         if late {

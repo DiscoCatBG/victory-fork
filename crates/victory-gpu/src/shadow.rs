@@ -1992,6 +1992,80 @@ impl Shadow {
         (self.start, self.len)
     }
 
+    /// Whether `buffer` is a plain copy whose bytes the card can take from
+    /// or give to another copy by offset (`address - start`): not one in
+    /// the card's memory ([`cards`]) and not the title's own memory
+    /// (`crate::inplace`).
+    pub(crate) fn plain(&self) -> bool {
+        self.card.is_none() && self.place.is_none()
+    }
+
+    /// Whether title memory `[address, end)`, inside a plain copy, holds
+    /// what the copy's snapshot holds there: the bytes taken when a
+    /// submission still in flight declared that its shaders write there.
+    /// Then, once those shaders have run, the copy's buffer holds over that
+    /// range exactly what title memory will hold after their copy-back (the
+    /// shaders' bytes where they wrote, the title's where they did not), and
+    /// another copy may take it from there on the card
+    /// (`crate::host::alias_forward`). False with no snapshot, outside the
+    /// copy, or where title memory cannot be read.
+    pub(crate) fn snapshot_is_title(&self, address: usize, end: usize) -> bool {
+        let start = self.start as usize;
+        if !self.plain() || address >= end || address < start || end > start + self.len as usize {
+            return false;
+        }
+        let (from, to) = (address - start, end - start);
+        let before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(taken) = before.as_ref().and_then(|b| b.get(from..to)) else {
+            return false;
+        };
+        let mut now = vec![0u8; to - from];
+        crate::host::read_into(address as *const u8, &mut now) && now == taken
+    }
+
+    /// A plain copy over `buffer` (mapped at `data`) of title memory
+    /// `[start, start + len)`, for tests; `before` is its snapshot.
+    #[cfg(test)]
+    pub(crate) fn for_test(buffer: ID3D12Resource, data: *mut u8, start: u64, len: u64, before: Option<Vec<u8>>) -> Shadow {
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let shadow = Shadow::new(buffer, data, gpu, start, len);
+        *shadow.before.lock().unwrap_or_else(|e| e.into_inner()) = before;
+        shadow
+    }
+
+    /// The copy's mapped bytes, for tests.
+    #[cfg(test)]
+    pub(crate) fn bytes_for_test(&self) -> &[u8] {
+        // SAFETY: the mapping holds `len` bytes while the copy lives.
+        unsafe { std::slice::from_raw_parts(self.data, self.len as usize) }
+    }
+
+    /// Copies title range `[address, end)` from `other`'s mapped bytes into
+    /// this copy's, on the CPU; both plain and holding the range. For when
+    /// the card cannot take them across (`crate::host::alias_forward`), after
+    /// the flights have landed.
+    pub(crate) fn take_from(&self, other: &Shadow, address: usize, end: usize) {
+        let (start, other_start) = (self.start as usize, other.start as usize);
+        if !self.plain()
+            || !other.plain()
+            || address >= end
+            || address < start.max(other_start)
+            || end > (start + self.len as usize).min(other_start + other.len as usize)
+        {
+            return;
+        }
+        // SAFETY: both ranges lie inside the copies' mappings, which are
+        // different buffers.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                other.data.add(address - other_start),
+                self.data.add(address - start),
+                end - address,
+            );
+        }
+    }
+
     /// The offset of a title address in the copy, if it lies in it.
     pub(crate) fn offset_in(&self, address: u64) -> Option<u64> {
         address.checked_sub(self.start).filter(|&at| at < self.len)
