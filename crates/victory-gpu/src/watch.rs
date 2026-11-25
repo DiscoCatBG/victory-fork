@@ -1281,7 +1281,9 @@ mod tests {
         assert!(!guards().protected.contains(view / BLOCK));
         assert!(known_view(view));
         // Asked again, the block is reported written and guarded again.
-        assert_eq!(writes(view, view + 2 * BLOCK, true).map(|w| w.1.len()), Some(BLOCK / PAGE));
+        // (The guards are asked themselves: `writes` would leave the page
+        // in the journal for a later test that is given the same address.)
+        assert_eq!(guard(view, view + 2 * BLOCK), Some((view / PAGE..view / PAGE + 1).collect()));
         assert!(guards().protected.contains(view / BLOCK));
         // SAFETY: our view.
         unsafe {
