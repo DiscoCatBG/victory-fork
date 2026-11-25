@@ -13153,7 +13153,7 @@ mod tests {
         assert_eq!(
             lt.heap_props,
             vec![
-                (0x100C, 4),     // descriptor_data for structured UAV
+                (0x100B, 0),     // descriptor_data for structured UAV: raw, as the host view is (PalmVIDev 528a5340)
                 (0x100A, 0x409), // descriptor_data for typed UAV
                 (0x1002, 0x409), // descriptor_data for 2D image UAV
                 (0x1002, 0x409), // descriptor_data for 2D uint image UAV
