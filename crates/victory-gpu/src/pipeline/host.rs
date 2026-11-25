@@ -541,21 +541,66 @@ impl HostPipeline {
             return refuse("graphics state not kept (plain description)", shaders);
         };
         let state = g.describe();
-        if mesh.is_some() {
+        if let Some(ms) = mesh {
+            // A mesh shader whose outputs pass the 32 KiB D3D12 allows:
+            // it and the pixel shader translated together, its 16-bit
+            // outputs packed (#283), when both translate so and the host's
+            // pixel shaders read barycentrics. Otherwise the stages as
+            // translated alone (drivers that take outputs past the limit
+            // draw them).
+            let linked = ms
+                .mesh_link()
+                .filter(|_| host.barycentrics())
+                .and_then(|link| {
+                    let ms = ms.linked_dxil(link)?;
+                    let ps = match stages.get(1) {
+                        Some((ps, _)) => Some(ps.linked_dxil(link)?),
+                        None => None,
+                    };
+                    Some((ms, ps))
+                });
+            let bytecode = |dxil: &[u8]| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: dxil.as_ptr().cast(),
+                BytecodeLength: dxil.len(),
+            };
+            let (ms_code, ps_code) = match &linked {
+                Some((ms, ps)) => (
+                    bytecode(ms),
+                    ps.as_deref()
+                        .map_or(D3D12_SHADER_BYTECODE::default(), |ps| bytecode(ps)),
+                ),
+                None => (code(0), code(1)),
+            };
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `mesh_pipeline`); a
             // new name keeps such entries, stored before, from being
             // looked up again.
-            let name = super::library::name(
-                "mesh triangles",
-                &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
-                &state,
-            );
-            let made = if g.bounds && depth_bounds_test() {
-                bounds_pipeline(&host.device, &root, [none(), none(), code(0), code(1)], g, &name)
-            } else {
-                mesh_pipeline(&host.device, &root, code(0), code(1), g, &name)
+            let named = |ms: &D3D12_SHADER_BYTECODE, ps: &D3D12_SHADER_BYTECODE| {
+                super::library::name(
+                    "mesh triangles",
+                    &root_blob,
+                    &[&code_bytes(ms), &code_bytes(ps)],
+                    &state,
+                )
+            };
+            // With the depth bounds test on, the stream form (`bounds_pipeline`).
+            let make = |ms: D3D12_SHADER_BYTECODE, ps: D3D12_SHADER_BYTECODE| {
+                if g.bounds && depth_bounds_test() {
+                    bounds_pipeline(&host.device, &root, [none(), none(), ms, ps], g, &named(&ms, &ps))
+                } else {
+                    mesh_pipeline(&host.device, &root, ms, ps, g, &named(&ms, &ps))
+                }
+            };
+            let made = match make(ms_code, ps_code) {
+                // A linked pair the host refuses (a pixel shader that
+                // declares a packed semantic otherwise): the stages as
+                // translated alone.
+                Err(e) if linked.is_some() => {
+                    tracing::warn!(error = %e, ?shaders, "linked host mesh pipeline refused; trying the stages as translated alone");
+                    host.log_messages();
+                    make(code(0), code(1))
+                }
+                made => made,
             };
             let pso = match made {
                 Ok(pso) => pso,
