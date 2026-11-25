@@ -1822,8 +1822,14 @@ fn merge_runs() -> bool {
 
 /// The runs the card changed in a stretch about to be merged (`now` against
 /// the reference), or `None` where the whole stretch is written.
+/// (A stretch in many runs is written whole, as before: each write outside
+/// a view of our own asks the kernel about its pages.)
 fn card_runs(now: &[u8], held: &[u8]) -> Option<Vec<(usize, usize)>> {
-    merge_runs().then(|| changed_runs(now, held))
+    const MOST: usize = 8;
+    if !merge_runs() {
+        return None;
+    }
+    Some(changed_runs(now, held)).filter(|runs| runs.len() <= MOST)
 }
 
 /// Writes the merged stretch `title` back at title address `at`: its `runs`
