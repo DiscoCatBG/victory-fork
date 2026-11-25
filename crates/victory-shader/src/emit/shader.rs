@@ -37,6 +37,20 @@ pub const SLOT_ADDRESSES: u32 = SLOT_STRIDES_COUNT;
 /// addresses ([`SLOT_ADDRESSES`]).
 pub const SLOT_STRIDES_DWORDS: u32 = 3 * SLOT_STRIDES_COUNT;
 
+/// The root UAV `u<SLOT_HEAP_MARKS>` in [`ROOT_CBV_SPACE`] of a shader that
+/// stores (or does an atomic operation) through a buffer view it picks from
+/// the view heap at an index it computes: [`HEAP_MARKS_DWORDS`] dwords the
+/// host keeps, dword `i` set to 1 by every such store through heap slot `i`
+/// (the last dword is a sink, for lanes that do not run). On the console
+/// the store is in title memory at once; here it lands in a host copy, and
+/// the host copies back only ranges it knows were written. Tables name what
+/// a draw may write, nothing names what a computed index picks, and the
+/// heap's unordered views together cover about a gigabyte: the marks tell
+/// the host which of them shaders really write.
+pub const SLOT_HEAP_MARKS: u8 = 252;
+/// Dwords of the [`SLOT_HEAP_MARKS`] buffer: one per heap slot, and the sink.
+pub const HEAP_MARKS_DWORDS: u32 = SLOT_STRIDES_COUNT + 1;
+
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
 /// descriptors and other memory (the ray-tracing structure builder and the

@@ -7106,11 +7106,14 @@ impl Meter {
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
             crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
-        // Lists whose picking shaders can store, and the MB of the heap's
-        // unordered views they had (`crate::draw::heap_writes`).
+        // Lists whose shaders store through picked buffer views, and the MB
+        // of marked views they declared written (`crate::heap_marks`).
         let picked_w = crate::draw::HEAP_WRITE_LISTS.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_w_mb = crate::draw::HEAP_WRITE_BYTES.swap(0, Ordering::Relaxed) as f64 / 1048576.0 / frames;
         let picked_late = crate::draw::HEAP_LATE_REFRESHES.swap(0, Ordering::Relaxed) as f64 / frames;
+        let picked_slots = crate::heap_marks::WRITTEN_SLOTS.load(Ordering::Relaxed);
+        let picked_first = crate::heap_marks::FIRST_MARKS.load(Ordering::Relaxed);
+        let picked_ro = crate::heap_marks::READ_ONLY_MARKS.load(Ordering::Relaxed);
         // The structure builder's window bytes left in the host copies and
         // declared written (`crate::pipeline::bvh_bound`).
         let [bvh_out, bvh_in] = [0, 1].map(|i| {
@@ -7199,12 +7202,13 @@ impl Meter {
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                 {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms, {picked_w:.1} lists storing through picked views ({picked_w_mb:.1} MB of unordered views), {picked_late:.0} later refreshes; structure builder: {bvh_out:.1} MB of windows kept from title memory, {bvh_in:.1} MB in buffers declared;                  texture slots written so far: {placed} placed, {objects} of objects; \
+                 {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms, {picked_w:.1} lists storing through picked views ({picked_w_mb:.1} MB of marked views declared{picked_off}; {picked_slots} slots marked now, {picked_first} first marks and {picked_ro} marks on read-only views so far), {picked_late:.0} later refreshes; structure builder: {bvh_out:.1} MB of windows kept from title memory, {bvh_in:.1} MB in buffers declared;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
                  {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                 picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                 picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
+                picked_off = if crate::heap_marks::on() { "" } else { " but not copied back: VICTORY_HEAP_WRITES=0" },
                 picked_away = crate::draw::HEAP_TEXTURES_AWAY.load(Ordering::Relaxed),
                 du0 = crate::resource::DEPTH_UNORDERED[0].load(Ordering::Relaxed),
                 du1 = crate::resource::DEPTH_UNORDERED[1].load(Ordering::Relaxed),

@@ -1930,12 +1930,27 @@ fn glc_heap_uav_loads_stores_and_atomics_execute_on_gpu() {
         for u in &shader.user_data {
             ud[u.index as usize] = inputs[u.dword as usize];
         }
+        // Ours, after the constants in slot order: the marks of the heap
+        // slots stored through (the fork's: what the host copies back into
+        // title memory), then the table of strides by heap slot.
+        assert_eq!(shader.root_uavs, [super::SLOT_HEAP_MARKS]);
+        assert_eq!(shader.root_srvs, [super::SLOT_STRIDES]);
         let out = host
             .dispatch(
                 &root,
                 &pso,
                 &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (1, Root::Written(super::HEAP_MARKS_DWORDS)),
+                        (
+                            2,
+                            Root::View {
+                                srv: true,
+                                data: vec![0; 16],
+                            },
+                        ),
+                    ],
                     views: &[
                         View::RawUav(16),
                         View::TextureUav(2, 2),
@@ -1969,6 +1984,10 @@ fn glc_heap_uav_loads_stores_and_atomics_execute_on_gpu() {
         }
         // 2x1 R32_UINT texture UAV: 2 threads per group * 5 = 10 at (0,0) and (1,0).
         assert_eq!(&out[2][0..2], &[10, 10], "{label}: image_atomic_add glc");
+        // The buffer at heap slot 0 was stored through, and marked; the
+        // images at slots 1 and 2 are no buffers and leave no mark.
+        assert_eq!(out[3][0], 1, "{label}: the mark of heap slot 0");
+        assert!(out[3][1..].iter().all(|&m| m == 0), "{label}: no other mark");
         ran += 1;
     }
     assert!(

@@ -6777,6 +6777,63 @@ impl<'a> Lower<'a> {
         Ok(Some(v))
     }
 
+    /// A store or atomic operation through `src`, for lanes that run
+    /// (`guard`): if the program picks the descriptor from the view heap at
+    /// an index it computes, the heap slot's mark is set
+    /// ([`super::shader::SLOT_HEAP_MARKS`]), so that the host copies what
+    /// was written back into title memory. Lanes that do not run mark the
+    /// sink.
+    ///
+    /// shortcut: pixel and compute programs only. In another stage the
+    /// marks' root view would be that stage's first declared unordered
+    /// access view (picked ones are not declared), which asks for a shader
+    /// flag ("UAVs at every stage") this emitter does not set; such a
+    /// program's stores through picked views stay in the host copies.
+    fn mark_heap_write(&mut self, src: &Source, guard: Option<V>) -> Result<(), Why> {
+        use super::shader::{SLOT_HEAP_MARKS, SLOT_STRIDES_COUNT};
+        if !matches!(self.x.native.stage, HwStage::Ps | HwStage::Cs) {
+            return Ok(());
+        }
+        let Source::Loaded { load, first } = src else {
+            return Ok(());
+        };
+        let heap = self
+            .scalar
+            .get(load)
+            .and_then(|a| self.x.native.layout.get(a.param))
+            .is_some_and(|p| p.root == RootType::ResourceHeap);
+        if !heap {
+            return Ok(());
+        }
+        let c = self.cur;
+        let slot = self.heap_index(*load, *first, false)?;
+        let i32t = self.s.t.i32;
+        let last = self.s.m.i32(SLOT_STRIDES_COUNT - 1);
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let place = match guard {
+            Some(g) => {
+                let sink = self.s.m.i32(SLOT_STRIDES_COUNT);
+                self.s.m.select(c, g, slot, sink)
+            }
+            None => slot,
+        };
+        let two = self.s.m.i32(2);
+        let byte = self.s.m.bin(c, Bin::Shl, place, two);
+        let marks = self.s.root_uav_handle(SLOT_HEAP_MARKS);
+        let (iu, one, mask, align) = (self.s.m.undef(i32t), self.s.m.i32(1), self.s.m.i8(1), self.s.m.i32(4));
+        let void = self.s.t.void;
+        self.s.op(
+            c,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            void,
+            140,
+            &[marks, byte, iu, one, iu, iu, iu, mask, align],
+        );
+        Ok(())
+    }
+
     /// The title address (low, high dword) of the buffer view the scalar load
     /// at `load` picks from the view heap at an index the program computes,
     /// from the host's table by heap slot ([`super::shader::SLOT_ADDRESSES`]);
@@ -10825,6 +10882,9 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let uav = store || atomic.is_some() || self.is_uav(src);
+        if store || atomic.is_some() {
+            self.mark_heap_write(src, guard)?;
+        }
         let u = uav_bits(uav, cache.glc);
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some((bits, signed)) = narrow {
@@ -12576,6 +12636,9 @@ mod tests {
                 (0x100B, 0), // and in the block after it
             ]
         );
+        // The store through the picked view marks its heap slot for the
+        // host, which copies only marked buffers back into title memory.
+        assert!(l.root_uavs.contains(&crate::emit::SLOT_HEAP_MARKS));
     }
 
     #[test]
@@ -12602,6 +12665,8 @@ mod tests {
         let l = lower_with(&spin, vec![root(RootType::ResourceHeap, 0, 0)], vec![]).unwrap();
         validate_dxil(&l.dxil);
         assert_eq!(l.heap_props, vec![(0x100B, 0), (0x500B, 0)]);
+        // Nothing is stored through the picked view: no mark.
+        assert!(!l.root_uavs.contains(&crate::emit::SLOT_HEAP_MARKS));
 
         // Table resources: structured buffer UAV (`idxen glc`), typed buffer
         // UAV (`glc`), 2D image UAV (`image_load glc`, `image_store glc`,
