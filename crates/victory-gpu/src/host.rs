@@ -2471,9 +2471,10 @@ struct Forward {
 
 /// Since the last frame-rate line, of [`alias_forward`]: refreshes that
 /// took bytes on the card instead of waiting, ranges copied, their bytes,
-/// refreshes that waited because the check refused them, and submissions
-/// that waited for the card to pass a copy still queued ([`handed_blocks`]).
-static FORWARD_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+/// refreshes that waited because the check refused them, submissions that
+/// waited for the card to pass a copy still queued ([`handed_blocks`]), and
+/// ranges whose writing copy took the title's newer bytes first.
+static FORWARD_STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// A [`Forward`] the card may not have passed yet: `done` is the fence
 /// value signalled behind the submission it was sent ahead of. Until then
@@ -2615,12 +2616,12 @@ const FORWARD_CHECK_MOST: usize = 64 << 20;
 
 /// Why [`plan_forwards`] left a refresh to wait, in the order it looks:
 /// what each of [`FORWARD_REFUSED`] counts, for the line of flights.
-const FORWARD_WHY: [&str; 14] = [
+const FORWARD_WHY: [&str; 15] = [
     "bottom-of-pipe writes there",
     "the refreshing copy is in the card's memory",
     "the refreshing copy is in place",
     "a read-back writes there",
-    "two copies write there",
+    "two copies write the same bytes",
     "the refreshing copy's own shaders write there in a flight",
     "the refreshing copy's own shaders write there in this submission",
     "the writing copy is not among the flights' copies",
@@ -2628,15 +2629,26 @@ const FORWARD_WHY: [&str; 14] = [
     "the writing copy is in place",
     "the range is not inside both copies",
     "the writing copy has no snapshot",
-    "title memory is not what the snapshot took",
+    "title memory is not what the snapshot took and could not be put in",
     "over the bytes compared per submission",
+    "the writing copy takes bytes on the card itself",
 ];
 
 /// Since the last frame-rate line: the refreshes [`plan_forwards`] left to
 /// wait, by why ([`FORWARD_WHY`]). The first run with the hand-off (main
 /// 7447a7a, RX 7900 XT) had 6 to 16 of them a frame and not one refresh
 /// that took its bytes on the card, and one count for all of them.
-static FORWARD_REFUSED: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 14];
+static FORWARD_REFUSED: [std::sync::atomic::AtomicU64; 15] = [const { std::sync::atomic::AtomicU64::new(0) }; 15];
+
+/// Whether two of `pieces` (owner, from, to) belong to different copies
+/// and hold the same bytes: which of them wrote last is not known, so the
+/// refresh waits ([`plan_forwards`]).
+fn tangled_writers(pieces: &[(usize, usize, usize)]) -> bool {
+    pieces
+        .iter()
+        .enumerate()
+        .any(|(i, &(o, a, b))| pieces[..i].iter().any(|&(p, x, y)| p != o && x < b && y > a))
+}
 
 /// With flights in the air: the refreshes of `runs` that another copy's
 /// in-flight shader writes would block, and that can take those bytes on
@@ -2690,62 +2702,97 @@ fn plan_forwards(runs: &[&HostList]) -> (Vec<Forward>, Vec<(usize, usize, usize)
             }
             let others: Vec<(usize, usize, usize)> =
                 by_copy.iter().copied().filter(|&(o, a, b)| o != copy && a < end && b > from).collect();
-            let owner = others[0].0;
-            let writer = owners.iter().find(|s| Arc::as_ptr(s) as usize == owner);
-            let pieces: Vec<(usize, usize)> = others.iter().map(|&(_, a, b)| (a.max(from), b.min(end))).collect();
-            let bytes: usize = pieces.iter().map(|&(a, b)| b - a).sum();
+            // The pieces of the refreshed range, each with the copy whose
+            // shaders write it. Several copies may write one range, each
+            // its own pieces: only where two of them write the same bytes
+            // is it unknown which wrote last.
+            let pieces: Vec<(usize, usize, usize)> =
+                others.iter().map(|&(o, a, b)| (o, a.max(from), b.min(end))).collect();
             let over = |ranges: &[(usize, usize, usize)]| {
                 ranges.iter().any(|&(o, a, b)| o == copy && others.iter().any(|&(_, x, y)| x < b && y > a))
             };
-            // Why it waits, if it does ([`FORWARD_WHY`]).
-            let why = if touches(&immed, from, end) {
+            let tangled = tangled_writers(&pieces);
+            // Why it waits, if it does ([`FORWARD_WHY`]), and the writing
+            // copy of each piece.
+            let mut writers: Vec<Arc<crate::shadow::Shadow>> = Vec::with_capacity(pieces.len());
+            let mut why = if touches(&immed, from, end) {
                 Some(0)
             } else if to.carded() {
                 Some(1)
             } else if !to.plain() {
                 Some(2)
-            } else if others.iter().any(|&(o, ..)| o == 0) {
+            } else if pieces.iter().any(|&(o, ..)| o == 0) {
                 Some(3)
-            } else if others.iter().any(|&(o, ..)| o != owner) {
+            } else if tangled {
                 Some(4)
             } else if over(&by_copy) {
                 Some(5)
             } else if over(&given) {
                 Some(6)
             } else {
-                match writer {
-                    None => Some(7),
-                    Some(w) if w.carded() => Some(8),
-                    Some(w) if !w.plain() => Some(9),
-                    Some(w) => {
-                        let (ws, wl) = w.span();
-                        let (ts, tl) = to.span();
-                        let inside =
-                            |&(a, b): &(usize, usize)| (a as u64) >= ws.max(ts) && (b as u64) <= (ws + wl).min(ts + tl);
-                        if !pieces.iter().all(inside) {
-                            Some(10)
-                        } else if !w.snapshot_taken() {
-                            Some(11)
-                        } else if checked + bytes > FORWARD_CHECK_MOST {
-                            Some(13)
-                        } else {
-                            checked += bytes;
-                            (!pieces.iter().all(|&(a, b)| w.snapshot_is_title(a, b))).then_some(12)
+                None
+            };
+            if why.is_none() {
+                for &(o, a, b) in &pieces {
+                    let Some(w) = owners.iter().find(|s| Arc::as_ptr(s) as usize == o) else {
+                        why = Some(7);
+                        break;
+                    };
+                    let (ws, wl) = w.span();
+                    let (ts, tl) = to.span();
+                    if w.carded() {
+                        why = Some(8);
+                    } else if !w.plain() {
+                        why = Some(9);
+                    } else if (a as u64) < ws.max(ts) || (b as u64) > (ws + wl).min(ts + tl) {
+                        why = Some(10);
+                    } else if !w.snapshot_taken() {
+                        why = Some(11);
+                    } else if checked + (b - a) > FORWARD_CHECK_MOST {
+                        why = Some(13);
+                    } else if w.handed_holds(a, b) {
+                        // Its own bytes are coming from the card: what it
+                        // holds now is neither the title's nor the writer's.
+                        why = Some(14);
+                    } else {
+                        checked += b - a;
+                        if !w.snapshot_is_title(a, b) {
+                            // The title wrote there since the writing copy
+                            // took its snapshot. Its bytes are put into that
+                            // copy beside the shader writes, as a refresh
+                            // under flights does ([`late_exact`]), and the
+                            // two are compared again: where that works the
+                            // copy holds what title memory will hold after
+                            // the copy-back again, and the card may pass it
+                            // on.
+                            let merged = late_exact() && {
+                                let mut runs_left = 512;
+                                !w.merge_under_writes(a, b - a, &mut runs_left) && w.snapshot_is_title(a, b)
+                            };
+                            if merged {
+                                FORWARD_STATS[5].fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                why = Some(12);
+                            }
                         }
                     }
+                    if why.is_some() {
+                        break;
+                    }
+                    writers.push(w.clone());
                 }
-            };
-            let Some(writer) = writer.filter(|_| why.is_none()) else {
+            }
+            if let Some(why) = why {
                 FORWARD_STATS[3].fetch_add(1, Ordering::Relaxed);
-                FORWARD_REFUSED[why.unwrap_or(7)].fetch_add(1, Ordering::Relaxed);
+                FORWARD_REFUSED[why].fetch_add(1, Ordering::Relaxed);
                 continue;
-            };
+            }
             FORWARD_STATS[0].fetch_add(1, Ordering::Relaxed);
-            for (a, b) in pieces {
+            for (&(_, a, b), writer) in pieces.iter().zip(writers) {
                 FORWARD_STATS[1].fetch_add(1, Ordering::Relaxed);
                 FORWARD_STATS[2].fetch_add((b - a) as u64, Ordering::Relaxed);
                 forwards.push(Forward {
-                    from: writer.clone(),
+                    from: writer,
                     to: to.clone(),
                     address: a,
                     end: b,
@@ -3233,13 +3280,15 @@ fn late_line(frames: f64) {
         tracing::info!(
             "refreshes over another copy's in-flight shader writes, per frame: {:.1} took the bytes on the card ({:.1} ranges, {:.1} MB) \
              instead of waiting, {:.1} waited (title wrote there since, no snapshot, a read-back, two writers, the copy's own \
-             shaders write there, or a copy not plain), {:.1} submissions waited for the card to pass such a copy still queued \
+             shaders write there, or a copy not plain), {:.1} submissions waited for the card to pass such a copy still queued; \
+             {:.1} of the ranges had the title's newer bytes put into the writing copy first \
              (VICTORY_ALIAS_FORWARD=0: all wait)",
             f[0],
             f[1],
             f[2] / 1048576.0,
             f[3],
             f[4],
+            f[5],
         );
         let why: Vec<String> = FORWARD_REFUSED
             .iter()
@@ -3413,6 +3462,23 @@ mod forward_tests {
         drop((a, b));
         // SAFETY: the allocation above; nothing names it any more.
         unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+    }
+
+    /// Pieces of one refreshed range written by different copies are
+    /// forwarded where each copy has its own bytes, and wait where two of
+    /// them hold the same byte ([`super::tangled_writers`]).
+    #[test]
+    fn two_writers_tangle_only_where_they_write_the_same_bytes() {
+        use super::tangled_writers;
+        let (a, b) = (0xaaaa_0000usize, 0xbbbb_0000usize);
+        assert!(!tangled_writers(&[]));
+        assert!(!tangled_writers(&[(a, 10, 20)]));
+        // Side by side, and the same copy twice.
+        assert!(!tangled_writers(&[(a, 10, 20), (b, 20, 30)]));
+        assert!(!tangled_writers(&[(a, 10, 20), (a, 15, 30)]));
+        // The same byte from two copies.
+        assert!(tangled_writers(&[(a, 10, 20), (b, 19, 30)]));
+        assert!(tangled_writers(&[(a, 10, 20), (a, 40, 50), (b, 0, 11)]));
     }
 
     #[test]

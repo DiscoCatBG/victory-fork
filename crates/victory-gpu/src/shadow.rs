@@ -2228,6 +2228,13 @@ impl Shadow {
         *self.handed.lock().unwrap_or_else(|e| e.into_inner()) = ranges;
     }
 
+    /// Whether a copy queued on the card fills part of title range
+    /// `[address, end)` of this copy ([`Shadow::hand`]): the CPU puts
+    /// nothing there until the card has passed it.
+    pub(crate) fn handed_holds(&self, address: usize, end: usize) -> bool {
+        self.handed.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < end && e > address)
+    }
+
     /// Title range `[address, end)` of this copy is about to be filled on
     /// the card from another copy's buffer: a kept snapshot is not current
     /// there any more.
