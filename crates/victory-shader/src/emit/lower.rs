@@ -3883,6 +3883,22 @@ impl<'a> Lower<'a> {
             // lanes it adds only feed derivatives, and exports keep their own
             // masks. Wrong if such a section had a side effect.
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
+            // On host waves of 32 that do not exchange (a console wave64 run
+            // as halves) `lane_bit` takes the host lane, so both waves would
+            // test the low dword: only a constant with equal dwords is exact.
+            Atom::Opaque(_)
+                if self.console_lanes && self.exchange.is_none() && self.halves.is_some() =>
+            {
+                Err("an opaque lane mask in a half-wave")
+            }
+            Atom::Constant(k)
+                if self.console_lanes
+                    && self.exchange.is_none()
+                    && self.halves.is_some()
+                    && k as u32 != (k >> 32) as u32 =>
+            {
+                Err("a constant lane mask in a half-wave")
+            }
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
             Atom::Opaque(v) if self.console_lanes => {

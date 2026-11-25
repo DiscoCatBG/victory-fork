@@ -82,7 +82,11 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     // A DLL indexes its TLS properly; only an exe assumes index 0.
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
-        unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
+        if let Err(err) = unsafe { crate::tls::redirect(loaded.base(), &loaded.info) } {
+            // SAFETY: just mapped, never registered, and no title code has run.
+            unsafe { loaded.unload() };
+            return Err(err);
+        }
     }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
@@ -156,7 +160,11 @@ fn map_dll(
     let original = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let prepared = prepare(&original).with_context(|| format!("preparing {}", path.display()))?;
     let image = load(&prepared, dirs.1).with_context(|| format!("loading {}", path.display()))?;
-    map_imports(&image.info, dirs, wanted, seen, loaded)?;
+    if let Err(err) = map_imports(&image.info, dirs, wanted, seen, loaded) {
+        // SAFETY: `image` was just mapped and never attached; no title code ran.
+        unsafe { image.unload() };
+        return Err(err);
+    }
     loaded.push((key, image));
     Ok(())
 }
