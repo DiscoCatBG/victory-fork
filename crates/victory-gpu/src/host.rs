@@ -5897,6 +5897,7 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        batch.fill_now();
         batch.flush();
         crate::watch::ask_once_end();
         // The writing copies of ranges the CPU took back while their copy
@@ -7350,6 +7351,15 @@ impl HostList {
                     crate::watch::wrote(dst, len);
                     len
                 }
+                &Step::Fill(dst, src, len) if fills_joined() => {
+                    // They wait in the submission's batch until a step that
+                    // writes title memory, and go together (`fills_joined`).
+                    batch.fills.push((dst, src, len));
+                    while let Some(&Step::Fill(dst, src, len)) = steps.next_if(|s| matches!(s, Step::Fill(..))) {
+                        batch.fills.push((dst, src, len));
+                    }
+                    continue;
+                }
                 &Step::Fill(dst, src, len) => {
                     started = std::time::Instant::now();
                     let fill = |dst: usize, src: usize, len: usize| {
@@ -7465,6 +7475,9 @@ struct Batch {
     index: crate::fx::Map<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: crate::fx::Set<usize>,
+    /// Fills of upload memory not done yet ([`fills_joined`]): done before
+    /// a step that writes title memory and at the submission's end.
+    fills: Vec<(usize, usize, usize)>,
 }
 
 impl Batch {
@@ -7517,8 +7530,16 @@ impl Batch {
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
+        self.fill_now();
         self.flush();
         self.textures.clear();
+    }
+
+    /// The fills waiting ([`fills_joined`]), done now.
+    fn fill_now(&mut self) {
+        if !self.fills.is_empty() {
+            fill_joined(&mut self.fills);
+        }
     }
 
     fn flush(&mut self) {
@@ -7732,6 +7753,68 @@ fn mapped_run(at: usize, end: usize, write: bool) -> Option<usize> {
 
 fn mapped_whole(at: usize, len: usize, write: bool) -> bool {
     mapped_run(at, at.saturating_add(len), write) == Some(at.saturating_add(len))
+}
+
+/// Whether a submission's fills of upload memory from title memory are read
+/// together (on by default; `VICTORY_JOIN_FILLS=0` turns it off): those
+/// between two steps that write title memory, from all the submission's
+/// lists, sorted by where they read; the ones less than 4 KiB apart go by
+/// one kernel read (spans of 1 MiB at most) and are handed out from there.
+/// Each fill is a kernel read of its own otherwise ([`copy_mapped`]): some
+/// 12,000 a world frame, mostly constants a few hundred bytes long.
+/// PalmVIDev #229 and #245 (EricPlayZ: submission-thread copies 37.5 ->
+/// 31.4 ms a frame on an RTX 2070 SUPER).
+fn fills_joined() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_FILLS").is_none_or(|v| v != "0"))
+}
+
+/// Does `fills` (destination, source, bytes) as [`fills_joined`] says and
+/// empties it. A span the kernel cannot read whole (a page not mapped) goes
+/// fill by fill, as without the switch.
+fn fill_joined(fills: &mut Vec<(usize, usize, usize)>) {
+    const GAP: usize = 4 << 10;
+    const MOST: usize = 1 << 20;
+    thread_local! {
+        static SPAN: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    fills.sort_unstable_by_key(|f| f.1);
+    let mut i = 0;
+    while i < fills.len() {
+        let (from, mut to) = (fills[i].1, fills[i].1 + fills[i].2);
+        let mut j = i + 1;
+        while j < fills.len() && fills[j].1 <= to + GAP && fills[j].1 + fills[j].2 - from <= MOST {
+            to = to.max(fills[j].1 + fills[j].2);
+            j += 1;
+        }
+        let whole = SPAN.with(|span| {
+            let mut span = span.borrow_mut();
+            span.resize(to - from, 0);
+            if !read(from as *const u8, span.as_mut_ptr(), to - from) {
+                return false;
+            }
+            for &(dst, src, len) in &fills[i..j] {
+                // SAFETY: the destination is a list's upload memory of `len`
+                // bytes; the source lies in the span just read.
+                unsafe { std::ptr::copy_nonoverlapping(span.as_ptr().add(src - from), dst as *mut u8, len) };
+            }
+            true
+        });
+        if !whole {
+            for &(dst, src, len) in &fills[i..j] {
+                copy_mapped(dst as *mut u8, src as *const u8, len, false);
+            }
+        }
+        i = j;
+    }
+    fills.clear();
+}
+
+impl Drop for Batch {
+    /// Fills still waiting are done, whoever ends the batch.
+    fn drop(&mut self) {
+        self.fill_now();
+    }
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
