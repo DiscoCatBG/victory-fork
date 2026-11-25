@@ -2171,6 +2171,12 @@ impl Shadow {
         crate::host::read_into(address as *const u8, &mut now) && now == taken
     }
 
+    /// Whether the copy has a snapshot at all (taken when a submission
+    /// first declared that its shaders write the copy).
+    pub(crate) fn snapshot_taken(&self) -> bool {
+        self.before.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
     /// A plain copy over `buffer` (mapped at `data`) of title memory
     /// `[start, start + len)`, for tests; `before` is its snapshot.
     #[cfg(test)]

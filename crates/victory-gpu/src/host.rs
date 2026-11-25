@@ -2611,6 +2611,31 @@ fn handed_blocks(runs: &[&HostList], forwards: &[Forward]) -> bool {
 /// forward ([`alias_forward`]); past it, the rest waits.
 const FORWARD_CHECK_MOST: usize = 64 << 20;
 
+/// Why [`plan_forwards`] left a refresh to wait, in the order it looks:
+/// what each of [`FORWARD_REFUSED`] counts, for the line of flights.
+const FORWARD_WHY: [&str; 14] = [
+    "bottom-of-pipe writes there",
+    "the refreshing copy is in the card's memory",
+    "the refreshing copy is in place",
+    "a read-back writes there",
+    "two copies write there",
+    "the refreshing copy's own shaders write there in a flight",
+    "the refreshing copy's own shaders write there in this submission",
+    "the writing copy is not among the flights' copies",
+    "the writing copy is in the card's memory",
+    "the writing copy is in place",
+    "the range is not inside both copies",
+    "the writing copy has no snapshot",
+    "title memory is not what the snapshot took",
+    "over the bytes compared per submission",
+];
+
+/// Since the last frame-rate line: the refreshes [`plan_forwards`] left to
+/// wait, by why ([`FORWARD_WHY`]). The first run with the hand-off (main
+/// 7447a7a, RX 7900 XT) had 6 to 16 of them a frame and not one refresh
+/// that took its bytes on the card, and one count for all of them.
+static FORWARD_REFUSED: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 14];
+
 /// With flights in the air: the refreshes of `runs` that another copy's
 /// in-flight shader writes would block, and that can take those bytes on
 /// the card instead ([`alias_forward`]): the copies to make, and the
@@ -2664,32 +2689,53 @@ fn plan_forwards(runs: &[&HostList]) -> (Vec<Forward>, Vec<(usize, usize, usize)
             let others: Vec<(usize, usize, usize)> =
                 by_copy.iter().copied().filter(|&(o, a, b)| o != copy && a < end && b > from).collect();
             let owner = others[0].0;
-            let refused = touches(&immed, from, end)
-                || !to.plain()
-                // A read-back, or two writers.
-                || others.iter().any(|&(o, ..)| o == 0 || o != owner)
-                // The refreshing copy's own shaders write there too, in a
-                // flight or in this submission.
-                || by_copy.iter().any(|&(o, a, b)| o == copy && others.iter().any(|&(_, x, y)| x < b && y > a))
-                || given.iter().any(|&(o, a, b)| o == copy && others.iter().any(|&(_, x, y)| x < b && y > a));
             let writer = owners.iter().find(|s| Arc::as_ptr(s) as usize == owner);
             let pieces: Vec<(usize, usize)> = others.iter().map(|&(_, a, b)| (a.max(from), b.min(end))).collect();
             let bytes: usize = pieces.iter().map(|&(a, b)| b - a).sum();
-            let ok = !refused
-                && checked + bytes <= FORWARD_CHECK_MOST
-                && writer.is_some_and(|w| {
-                    let (ws, wl) = w.span();
-                    let (ts, tl) = to.span();
-                    w.plain()
-                        && pieces.iter().all(|&(a, b)| {
-                            (a as u64) >= ws.max(ts)
-                                && (b as u64) <= (ws + wl).min(ts + tl)
-                                && w.snapshot_is_title(a, b)
-                        })
-                });
-            checked += bytes;
-            let Some(writer) = writer.filter(|_| ok) else {
+            let over = |ranges: &[(usize, usize, usize)]| {
+                ranges.iter().any(|&(o, a, b)| o == copy && others.iter().any(|&(_, x, y)| x < b && y > a))
+            };
+            // Why it waits, if it does ([`FORWARD_WHY`]).
+            let why = if touches(&immed, from, end) {
+                Some(0)
+            } else if to.carded() {
+                Some(1)
+            } else if !to.plain() {
+                Some(2)
+            } else if others.iter().any(|&(o, ..)| o == 0) {
+                Some(3)
+            } else if others.iter().any(|&(o, ..)| o != owner) {
+                Some(4)
+            } else if over(&by_copy) {
+                Some(5)
+            } else if over(&given) {
+                Some(6)
+            } else {
+                match writer {
+                    None => Some(7),
+                    Some(w) if w.carded() => Some(8),
+                    Some(w) if !w.plain() => Some(9),
+                    Some(w) => {
+                        let (ws, wl) = w.span();
+                        let (ts, tl) = to.span();
+                        let inside =
+                            |&(a, b): &(usize, usize)| (a as u64) >= ws.max(ts) && (b as u64) <= (ws + wl).min(ts + tl);
+                        if !pieces.iter().all(inside) {
+                            Some(10)
+                        } else if !w.snapshot_taken() {
+                            Some(11)
+                        } else if checked + bytes > FORWARD_CHECK_MOST {
+                            Some(13)
+                        } else {
+                            checked += bytes;
+                            (!pieces.iter().all(|&(a, b)| w.snapshot_is_title(a, b))).then_some(12)
+                        }
+                    }
+                }
+            };
+            let Some(writer) = writer.filter(|_| why.is_none()) else {
                 FORWARD_STATS[3].fetch_add(1, Ordering::Relaxed);
+                FORWARD_REFUSED[why.unwrap_or(7)].fetch_add(1, Ordering::Relaxed);
                 continue;
             };
             FORWARD_STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -3193,6 +3239,16 @@ fn late_line(frames: f64) {
             f[3],
             f[4],
         );
+        let why: Vec<String> = FORWARD_REFUSED
+            .iter()
+            .zip(FORWARD_WHY)
+            .map(|(n, why)| (n.swap(0, Ordering::Relaxed) as f64 / frames, why))
+            .filter(|&(n, _)| n > 0.0)
+            .map(|(n, why)| format!("{n:.1} {why}"))
+            .collect();
+        if !why.is_empty() {
+            tracing::info!("of the refreshes that waited for another copy's shader writes, per frame, by why: {}", why.join(", "));
+        }
     }
     {
         let w: Vec<f64> = LATE_WAITED.iter().map(|w| w.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames).collect();
