@@ -2876,6 +2876,33 @@ impl State {
         #[cfg(feature = "diagnostics")]
         drop(phase);
         if let Some(view) = mirrored {
+            // A constant buffer view in a table whose shader names no
+            // constant buffer there: the title's slot is made as it is, and
+            // left null where the constants are not 256-byte aligned in
+            // their host copy (640,333 times in the ec21622 run; tables
+            // with a constant buffer the shader names are made afresh in
+            // `State::tables`, from upload memory). The first sixteen
+            // distinct readers are named, to tell what reads them.
+            if let View::Constant(address, size) = view
+                && address != 0
+            {
+                static SEEN: std::sync::Mutex<Vec<(ResourceType, u8, u32, bool)>> = std::sync::Mutex::new(Vec::new());
+                let reader = (u.kind, u.slot, u.table_offset_dwords, compute);
+                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                if seen.len() < 16 && !seen.contains(&reader) {
+                    seen.push(reader);
+                    tracing::warn!(
+                        kind = ?u.kind,
+                        slot = u.slot,
+                        dword = u.table_offset_dwords,
+                        compute,
+                        address = format_args!("{address:#x}"),
+                        size,
+                        pipeline = format_args!("{:#x}", self.pipeline),
+                        "a shader reads a constant buffer view through a table as another kind of view"
+                    );
+                }
+            }
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
