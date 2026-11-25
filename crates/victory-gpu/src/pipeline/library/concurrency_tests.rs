@@ -59,13 +59,14 @@ impl Compute {
             ..Default::default()
         };
         let mut created = false;
+        let mut before_create = Some(before_create);
         pipeline(
             &self.name,
             // SAFETY: the descriptor and its bytecode stay live through the calls.
             |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
             || {
                 created = true;
-                before_create()?;
+                before_create.take().map_or(Ok(()), |f| f())?;
                 // SAFETY: as above.
                 unsafe { host.device.CreateComputePipelineState(&desc) }
             },

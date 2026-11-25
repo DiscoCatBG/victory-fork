@@ -2923,6 +2923,7 @@ mod tests {
                     looks: u8::from(index % 3 == 0),
                     mapped: u64::from(index % 5 == 0),
                     checked: (0, 0, 0, 0, 0),
+                    mips: None,
                 },
             );
         }
