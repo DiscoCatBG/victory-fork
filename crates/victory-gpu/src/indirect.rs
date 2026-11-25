@@ -723,6 +723,16 @@ void main() {
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
     }
 
+    /// The push of shader writes from the card's memory (`crate::host`)
+    /// compiles, and the software adapter takes it.
+    #[test]
+    fn warp_card_push_compiles() {
+        let Some(warp) = WarpHarness::new() else {
+            return;
+        };
+        compile_cs(&warp.device, crate::host::CARD_PUSH).expect("the card push must compile on WARP");
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
