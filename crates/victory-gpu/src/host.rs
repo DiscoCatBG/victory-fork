@@ -1554,8 +1554,10 @@ fn card_push() -> bool {
 
 /// Since the last frame-rate line, of [`card_push`]: parts merged from the
 /// slots, their bytes, parts fetched because they were not in a slot.
-/// Then parts left to a later plan of the same landing that pushed them too.
-static PUSH_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// Then parts left to a later plan of the same landing that pushed them too,
+/// and parts merged that put nothing into title memory (flagged, but what
+/// the card held there was what the CPU's side held).
+static PUSH_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// The pass of [`card_push`]: one group of 64 threads per 4 KiB part of
 /// the range's pieces; a part whose bit the compare set in `differs` takes
@@ -4503,7 +4505,11 @@ impl Host {
                         // run, and no later one takes it before the landing
                         // says it is read.
                         let gpu = unsafe { std::slice::from_raw_parts(at as *const u8, hi - lo) };
-                        written += shadow.card_merge_relay(lo, gpu, sent_as, &mut title);
+                        let n = shadow.card_merge_relay(lo, gpu, sent_as, &mut title);
+                        if n == 0 {
+                            PUSH_STATS[4].fetch_add(1, Ordering::Relaxed);
+                        }
+                        written += n;
                         PUSH_STATS[0].fetch_add(1, Ordering::Relaxed);
                         PUSH_STATS[1].fetch_add((hi - lo) as u64, Ordering::Relaxed);
                     }
@@ -7480,11 +7486,13 @@ impl Meter {
                     tracing::info!(
                         "what shaders wrote to copies in the card's memory, per frame: {:.0} parts ({:.1} MB) pushed down in their own \
                          submission and merged with no fetch, {:.0} parts fetched because they found no slot (VICTORY_CARD_PUSH=0: \
-                         all fetched), {:.0} pushed parts left to a later flight of the same landing that pushed them too",
+                         all fetched), {:.0} pushed parts left to a later flight of the same landing that pushed them too, \
+                         {:.0} merged parts that changed nothing in title memory",
                         pushed[0],
                         pushed[1] / 1e6,
                         pushed[2],
-                        pushed[3]
+                        pushed[3],
+                        pushed[4]
                     );
                 }
             }
