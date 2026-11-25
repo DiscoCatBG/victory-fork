@@ -93,6 +93,8 @@ mod own_bits;
 mod rect;
 mod sampler;
 #[cfg(all(test, windows))]
+mod image_lod_tests;
+#[cfg(all(test, windows))]
 mod sampler_choice_tests;
 mod shader;
 mod sig_interp;
