@@ -19,6 +19,7 @@ fn element(name: &str, index: u32, kind: u8, comp: u8, row: u32, col: u8, cols: 
         cols,
         usage: 0,
         half: false,
+        packed: false,
     }
 }
 
