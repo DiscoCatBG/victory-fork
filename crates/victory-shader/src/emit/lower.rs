@@ -1419,6 +1419,7 @@ impl<'a> Lower<'a> {
             }
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
+        s.coherent = wants_coherent(p);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         // The console tests depth and stencil before a pixel program its
@@ -5536,6 +5537,11 @@ impl<'a> Lower<'a> {
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
             return Err(LANE_MASK);
         }
+        if name == "s_waitcnt_vscnt" {
+            // The wait for the program's stores to land: a fence there.
+            self.device_fence();
+            return Ok(());
+        }
         if self.pops
             && matches!(name, "s_setreg_imm32_b32" | "s_setreg_b32")
             && imm.is_some_and(|i| i & 0x3F == HW_REG_POPS_PACKER)
@@ -6134,6 +6140,25 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// A fence over all device memory (`DeviceMemoryBarrier`: the global UAV
+    /// fence, no group sync) in a compute program with coherent views
+    /// ([`wants_coherent`]), where the console orders its accesses against
+    /// other groups': the wait for its stores to land (`s_waitcnt_vscnt`,
+    /// before a store or atomic that tells another group they are there)
+    /// and a cache invalidation (`buffer_gl0_inv`, `buffer_gl1_inv`,
+    /// `s_gl1_inv`, `s_dcache_inv`, before reads of what another group
+    /// wrote). The host orders a thread's accesses to different addresses
+    /// for other groups only at a fence. Elsewhere nothing: a program
+    /// without coherent views exchanges nothing with other groups.
+    fn device_fence(&mut self) {
+        if !self.s.coherent || self.s.threads.is_none() || self.s.mesh.is_some() {
+            return;
+        }
+        let (mode, void) = (self.s.m.i32(2), self.s.t.void);
+        self.s
+            .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
     fn smem(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Fields::Smem {
             data,
@@ -6146,6 +6171,10 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        if matches!(name, "s_dcache_inv" | "s_gl1_inv") {
+            self.device_fence();
+            return Ok(());
+        }
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
@@ -11518,7 +11547,9 @@ impl<'a> Lower<'a> {
         };
         let name = inst.name();
         if name == "buffer_gl0_inv" || name == "buffer_gl1_inv" {
-            // The host has no console buffer cache to invalidate.
+            // The host has no console buffer cache to invalidate; what the
+            // invalidation orders is a fence there (`device_fence`).
+            self.device_fence();
             return Ok(());
         }
         if *lds || *tfe {
@@ -12840,6 +12871,39 @@ impl<'a> Lower<'a> {
     }
 }
 
+/// Whether a program's UAVs are globally coherent. The console keeps
+/// memory coherent between the groups of a dispatch only where a program
+/// asks for it: cache-control bits (GLC, DLC, SLC) on a memory or scalar
+/// load or store, a memory atomic, or an explicit cache invalidation. A
+/// program that does none of these reads only what no other group of the
+/// dispatch writes, or writes only what none reads, so its views stay
+/// plain and the host may keep them in its first-level caches. One that
+/// does (the title's BVH builder: atomics, then reads of what other groups
+/// wrote) has every UAV globally coherent: the host then makes a group's
+/// accesses see other groups' writes, which a plain view need not.
+pub(crate) fn wants_coherent(p: &crate::ir::Program) -> bool {
+    p.blocks.iter().flat_map(|b| &b.insts).any(|inst| {
+        let name = inst.name();
+        let bits = match &inst.fields {
+            Fields::Buffer { cache, .. }
+            | Fields::Image { cache, .. }
+            | Fields::Flat { cache, .. }
+            | Fields::Smem { cache, .. } => cache.glc || cache.dlc || cache.slc,
+            _ => false,
+        };
+        let atomic = name.contains("atomic")
+            && matches!(
+                inst.fields,
+                Fields::Buffer { .. } | Fields::Image { .. } | Fields::Flat { .. }
+            );
+        let invalidate = matches!(
+            name,
+            "buffer_gl0_inv" | "buffer_gl1_inv" | "s_gl1_inv" | "s_dcache_inv"
+        );
+        bits || atomic || invalidate
+    })
+}
+
 /// The DXIL interpolation mode of a kind of barycentrics (none for the
 /// pull model).
 fn interp_mode(kind: Barycentric) -> Option<u8> {
@@ -13661,9 +13725,9 @@ mod tests {
         assert_eq!(
             l.heap_props,
             vec![
-                (0x100B, 0),    // UAV @ 0 handle (descriptor_data + load + store)
+                (0x500B, 0),    // UAV @ 0 handle (descriptor_data + load + store)
                 (0x000B, 0),    // read-only SRV @ 1 handle (descriptor_data + load)
-                (0x100B, 0),    // getDimensions of UAV @ 0: a handle of its own (fxceless#452)
+                (0x500B, 0),    // getDimensions of UAV @ 0: a handle of its own (fxceless#452)
                 (0x500B, 0),    // buffer_load_dword glc on UAV @ 0
                 // s_buffer_load_dword on read-only @ 2: no used-resource
                 // entry, so the fork reads it as a buffer the program picks
@@ -13673,8 +13737,8 @@ mod tests {
                 (0x000B, 0), // getDimensions of read-only @ 1: a handle of its own (fxceless#452)
                 (13, 0x1_0000),
                 (0x500B, 0), // s_buffer_load_dword glc on reloaded UAV @ 0
-                (0x100B, 0), // s_buffer_load_dword on reloaded UAV @ 0
-                (0x100B, 0), // and in the block after it
+                (0x500B, 0), // s_buffer_load_dword on reloaded UAV @ 0
+                (0x500B, 0), // and in the block after it
             ]
         );
         // The store through the picked view marks its heap slot for the
@@ -13705,7 +13769,7 @@ mod tests {
         ];
         let l = lower_with(&spin, vec![root(RootType::ResourceHeap, 0, 0)], vec![]).unwrap();
         validate_dxil(&l.dxil);
-        assert_eq!(l.heap_props, vec![(0x100B, 0), (0x500B, 0)]);
+        assert_eq!(l.heap_props, vec![(0x500B, 0), (0x500B, 0)]);
         // Nothing is stored through the picked view: no mark.
         assert!(!l.root_uavs.contains(&crate::emit::SLOT_HEAP_MARKS));
 
@@ -13804,10 +13868,10 @@ mod tests {
         assert_eq!(
             lt.heap_props,
             vec![
-                (0x100B, 0),     // descriptor_data for structured UAV: raw, as the host view is (PalmVIDev 528a5340)
-                (0x100A, 0x409), // descriptor_data for typed UAV
-                (0x1002, 0x409), // descriptor_data for 2D image UAV
-                (0x1002, 0x409), // descriptor_data for 2D uint image UAV
+                (0x500B, 0),     // descriptor_data for structured UAV: raw, as the host view is (PalmVIDev 528a5340)
+                (0x500A, 0x409), // descriptor_data for typed UAV
+                (0x5002, 0x409), // descriptor_data for 2D image UAV
+                (0x5002, 0x409), // descriptor_data for 2D uint image UAV
                 (0x000B, 0),     // descriptor_data + glc load for table SRV
                 (0x500B, 0),     // structured UAV glc (read raw in the fork)
                 (0x500A, 0x409), // typed UAV glc (shared by load and store)
@@ -13816,5 +13880,35 @@ mod tests {
                 (0x000B, 0),     // getDimensions of the table SRV: a handle of its own (fxceless#452)
             ]
         );
+    }
+
+    /// Which programs get globally coherent views: cache-control bits on a
+    /// memory or scalar access, a memory atomic or a cache invalidation; not
+    /// plain buffer accesses, nor LDS atomics (group memory).
+    #[test]
+    fn coherent_views_follow_cache_bits_atomics_and_invalidations() {
+        let wants = |body: &[u32]| {
+            let mut words = body.to_vec();
+            words.push(0xBF81_0000); // s_endpgm
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            crate::emit::lower::wants_coherent(&crate::ir::build(&code, false, 8).unwrap())
+        };
+        // buffer_load_dword v1, v0, s[4:7], 0 offen / buffer_store_dword
+        // v1, v0, s[4:7], 0 offen
+        let plain = [0xE030_1000, 0x8001_0100, 0xE070_1000, 0x8001_0100];
+        assert!(!wants(&plain));
+        // ds_add_u32 v0, v1: an atomic on group memory, not on a view.
+        assert!(!wants(&[0xD800_0000, 0x0000_0100]));
+        // The same load with glc (bit 14), dlc (bit 15) or slc (dword 1 bit 22).
+        assert!(wants(&[0xE030_5000, 0x8001_0100]));
+        assert!(wants(&[0xE030_9000, 0x8001_0100]));
+        assert!(wants(&[0xE030_1000, 0x8041_0100]));
+        // buffer_atomic_add v1, v0, s[4:7], 0 offen
+        assert!(wants(&[0xE0C8_1000, 0x8001_0100]));
+        // buffer_gl0_inv
+        assert!(wants(&[0xE1C4_0000, 0x0000_0000]));
+        // s_load_dword s8, s[4:5], 0x0 glc
+        assert!(wants(&[0xF401_0202, 0xFA00_0000]));
+        assert!(!wants(&[0xF400_0202, 0xFA00_0000]));
     }
 }

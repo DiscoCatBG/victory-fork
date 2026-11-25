@@ -137,6 +137,9 @@ pub(crate) struct Types {
     pub res_ret: Ty,
 }
 
+/// Resource properties, word 0: a globally coherent UAV (bit 14).
+pub(crate) const COHERENT: u32 = 0x4000;
+
 /// What a mesh shader declares beyond its thread-group size.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Mesh {
@@ -202,6 +205,8 @@ pub(crate) struct Shader {
     /// Resource properties of each heap handle made, in creation order.
     #[cfg(test)]
     pub heap_props: Vec<(u32, u32)>,
+    /// Every UAV globally coherent (see `lower::wants_coherent`).
+    pub coherent: bool,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -261,6 +266,7 @@ impl Shader {
             nonuniform_handles: 0,
             #[cfg(test)]
             heap_props: Vec::new(),
+            coherent: false,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -394,7 +400,8 @@ impl Shader {
             217,
             &[bind, r, f],
         );
-        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        let props = 11 | 0x1000 | if self.coherent { COHERENT } else { 0 };
+        let h = self.annotate(block, h, props, 0);
         self.flags |= flags::RAW_BUFFERS;
         self.root_uavs.push((slot, h));
         h
@@ -506,6 +513,12 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(count_nonuniform);
+        // Resource properties: bit 12 a UAV, bit 14 globally coherent.
+        let props = if self.coherent && props.0 & 0x1000 != 0 {
+            (props.0 | COHERENT, props.1)
+        } else {
+            props
+        };
         #[cfg(test)]
         self.heap_props.push(props);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
@@ -667,6 +680,8 @@ impl Shader {
                 let u = self.m.undef(p);
                 let no = self.m.bool(false);
                 let no = self.m.md_value(no);
+                let coherent = self.m.bool(self.coherent);
+                let coherent = self.m.md_value(coherent);
                 let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
                     // Id, variable, name, space, lower bound, range size,
@@ -682,7 +697,7 @@ impl Shader {
                         Some(i32c(&mut self, u32::from(slot))),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
-                        Some(no),
+                        Some(coherent),
                         Some(no),
                         Some(ordered),
                         None,
