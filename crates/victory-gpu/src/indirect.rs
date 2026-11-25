@@ -501,7 +501,7 @@ fn record_hoisted(
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
             l.SetComputeRootUnorderedAccessView(4, budget);
-            l.Dispatch(spec.2.div_ceil(64), 1, 1);
+            l.Dispatch(dispatch_groups_x(spec.2), 1, 1);
         }
         l.ResourceBarrier(&[uav_barrier()]);
     }
