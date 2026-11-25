@@ -1545,7 +1545,8 @@ fn card_push() -> bool {
 
 /// Since the last frame-rate line, of [`card_push`]: parts merged from the
 /// slots, their bytes, parts fetched because they were not in a slot.
-static PUSH_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// Then parts left to a later plan of the same landing that pushed them too.
+static PUSH_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// The pass of [`card_push`]: one group of 64 threads per 4 KiB part of
 /// the range's pieces; a part whose bit the compare set in `differs` takes
@@ -4079,16 +4080,15 @@ impl Host {
             // before these are done with (`card_done`).
             let differs = unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) };
             let mut seen = std::collections::HashSet::new();
-            for (plan, map) in plans.iter().zip(&pushed) {
-                // The parts that went down with the plan's own pass: merged
-                // from their slots, as they were when its lists had run
-                // (behind its own send of title bytes, ahead of later ones).
-                let mut merged = std::collections::HashSet::new();
-                if let (Some((_, sent_as)), Some((slots, _, _))) = (plan.push, push)
-                    && !map.is_empty()
-                {
-                    for r in plan.ranges.iter().filter(|r| r.compared) {
-                        let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
+            // The parts that went down with each plan's own pass: (range,
+            // offsets in the copy, where they lie in the slots' mapping).
+            let mut parts: Vec<Vec<(usize, usize, usize, usize)>> = vec![Vec::new(); plans.len()];
+            if let Some((slots, _, _)) = push {
+                for ((plan, map), parts) in plans.iter().zip(&pushed).zip(parts.iter_mut()) {
+                    if plan.push.is_none() || map.is_empty() {
+                        continue;
+                    }
+                    for (i, r) in plan.ranges.iter().enumerate().filter(|(_, r)| r.compared) {
                         for p in 0..r.span.pieces {
                             let dword = r.at + p;
                             let mask = differs.get(dword as usize).copied().unwrap_or(0) & 0xFFFF;
@@ -4104,20 +4104,46 @@ impl Host {
                                     if lo < base || hi - base > PUSH_SLOT as usize {
                                         continue;
                                     }
-                                    // SAFETY: inside the slots' mapping (the
-                                    // check above); the pass that filled the
-                                    // slot has run, and no later one takes it
-                                    // before the landing says it is read.
-                                    let gpu = unsafe {
-                                        std::slice::from_raw_parts((slots + slot as usize * PUSH_SLOT as usize + (lo - base)) as *const u8, hi - lo)
-                                    };
-                                    written += r.shadow.card_merge_relay(lo, gpu, sent_as, &mut title);
-                                    merged.insert((copy, lo, hi));
-                                    PUSH_STATS[0].fetch_add(1, Ordering::Relaxed);
-                                    PUSH_STATS[1].fetch_add((hi - lo) as u64, Ordering::Relaxed);
+                                    parts.push((i, lo, hi, slots + slot as usize * PUSH_SLOT as usize + (lo - base)));
                                 }
                             }
                         }
+                    }
+                }
+            }
+            // A part several plans of this landing pushed is merged from the
+            // last of them only: its bytes hold what the earlier ones wrote
+            // too (unless it wrote them over), as a fetch after all of them
+            // did. Run C's flights rewrote the same parts again and again:
+            // merged from every plan, they were 294 MB a frame.
+            let mut last: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
+            for (n, (plan, parts)) in plans.iter().zip(&parts).enumerate().rev() {
+                for &(i, lo, hi, _) in parts {
+                    last.entry((std::sync::Arc::as_ptr(&plan.ranges[i].shadow) as usize, lo, hi)).or_insert(n);
+                }
+            }
+            for (n, (plan, parts)) in plans.iter().zip(&parts).enumerate() {
+                // Merged from their slots, as they were when the plan's lists
+                // had run (behind its own send of title bytes, ahead of later
+                // ones); a part a later plan pushed is left to that plan.
+                let mut merged = std::collections::HashSet::new();
+                if let Some((_, sent_as)) = plan.push {
+                    for &(i, lo, hi, at) in parts {
+                        let shadow = &plan.ranges[i].shadow;
+                        let key = (std::sync::Arc::as_ptr(shadow) as usize, lo, hi);
+                        merged.insert(key);
+                        if last.get(&key) != Some(&n) {
+                            PUSH_STATS[3].fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        // SAFETY: inside the slots' mapping (checked when the
+                        // part was taken); the pass that filled the slot has
+                        // run, and no later one takes it before the landing
+                        // says it is read.
+                        let gpu = unsafe { std::slice::from_raw_parts(at as *const u8, hi - lo) };
+                        written += shadow.card_merge_relay(lo, gpu, sent_as, &mut title);
+                        PUSH_STATS[0].fetch_add(1, Ordering::Relaxed);
+                        PUSH_STATS[1].fetch_add((hi - lo) as u64, Ordering::Relaxed);
                     }
                 }
                 let flags: Vec<(usize, u32, u32)> = plan
@@ -6862,10 +6888,11 @@ impl Meter {
                     tracing::info!(
                         "what shaders wrote to copies in the card's memory, per frame: {:.0} parts ({:.1} MB) pushed down in their own \
                          submission and merged with no fetch, {:.0} parts fetched because they found no slot (VICTORY_CARD_PUSH=0: \
-                         all fetched)",
+                         all fetched), {:.0} pushed parts left to a later flight of the same landing that pushed them too",
                         pushed[0],
                         pushed[1] / 1e6,
-                        pushed[2]
+                        pushed[2],
+                        pushed[3]
                     );
                 }
             }
