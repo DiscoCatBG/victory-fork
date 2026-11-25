@@ -868,6 +868,23 @@ impl BufferStates {
 }
 
 /// A host command list and its allocator, always used together.
+/// The bytes of one buffer of hoisted clamped indirect arguments.
+const HOIST_CHUNK: u64 = 256 << 10;
+
+/// Where [`HostList::hoist_mark`]s come from.
+static HOIST_MARKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A list's buffers for hoisted clamped indirect arguments
+/// ([`HostList::clamp_room`]): the buffers, how many this recording uses,
+/// the bytes taken of the last of those. Each starts a recording in the
+/// common state (buffers decay to it when a submission has run).
+#[derive(Default)]
+pub(crate) struct Hoisted {
+    chunks: Vec<ID3D12Resource>,
+    used: usize,
+    at: u64,
+}
+
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
@@ -900,6 +917,16 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// When this list holds the hoisted clamps of the list after it
+    /// (`crate::indirect::hoisting`): the buffers the clamped arguments go
+    /// to ([`HostList::clamp_room`]).
+    hoisted: Mutex<Hoisted>,
+    /// Changes whenever something recorded may change indirect arguments
+    /// (a title copy, a shader write to be copied back, deferred work):
+    /// clamps hoisted before the list hold while it stays the same
+    /// ([`HostList::hoist_mark`]). Taken from [`HOIST_MARKS`], so no two
+    /// lists, and no list before and after a reset, share a value.
+    hoist_mark: std::sync::atomic::AtomicU64,
     /// With [`fill_on_card`]: a device-local buffer constant buffer views of
     /// the list read, filled by copies on the card ([`HostList::card_constants`]):
     /// the buffer, the bytes used, and whether it is in the constant buffer
@@ -4375,6 +4402,8 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                hoisted: Mutex::default(),
+                hoist_mark: std::sync::atomic::AtomicU64::new(0),
                 card_constants: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
@@ -6419,6 +6448,8 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // Hoisted clamps it holds: readable as arguments by the list after.
+        self.clamp_end();
         self.twins_to_depth();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
@@ -6444,6 +6475,11 @@ impl HostList {
         let started = std::time::Instant::now();
         self._alive.used();
         *self.deferred() = Deferred::default();
+        self.bump_hoist_mark();
+        {
+            let mut hoisted = self.hoisted.lock().unwrap_or_else(|e| e.into_inner());
+            (hoisted.used, hoisted.at) = (0, 0);
+        }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.buffer_states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6980,6 +7016,7 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
+        self.bump_hoist_mark();
         deferred.refreshed.clear();
         deferred.memory_read_seen = 0;
     }
@@ -7072,6 +7109,7 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len));
+        self.bump_hoist_mark();
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -7308,10 +7346,93 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
+        self.bump_hoist_mark();
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
         deferred.refreshed.clear();
         deferred.memory_read_seen = 0;
+    }
+
+    /// What was recorded so far that may change indirect arguments, as a
+    /// mark: clamps hoisted before this list (`crate::indirect::hoisting`)
+    /// stay good for its indirect calls while it is the same.
+    pub(crate) fn hoist_mark(&self) -> u64 {
+        self.hoist_mark.load(Ordering::Relaxed)
+    }
+
+    /// Something recorded may change indirect arguments (or a hoist begins
+    /// on this list): a mark no list had before.
+    pub(crate) fn bump_hoist_mark(&self) {
+        let next = HOIST_MARKS.fetch_add(1, Ordering::Relaxed);
+        self.hoist_mark.store(next, Ordering::Relaxed);
+    }
+
+    /// Room for `bytes` of hoisted clamped indirect arguments in this
+    /// list's buffers, writable by shaders from here on in the list: the
+    /// buffer and the offset (on 16 bytes). None for more than a buffer
+    /// holds. The first room of a recording waits for every earlier shader
+    /// write (the title's passes that wrote the arguments).
+    pub(crate) fn clamp_room(&self, bytes: u64) -> Option<(ID3D12Resource, u64)> {
+        let bytes = bytes.max(16).next_multiple_of(16);
+        if bytes > HOIST_CHUNK {
+            return None;
+        }
+        let mut h = self.hoisted.lock().unwrap_or_else(|e| e.into_inner());
+        if h.used > 0 && h.at + bytes <= HOIST_CHUNK {
+            let at = h.at;
+            h.at += bytes;
+            return Some((h.chunks[h.used - 1].clone(), at));
+        }
+        if h.used == h.chunks.len() {
+            let buffer = host()?.uav_buffer(HOIST_CHUNK)?;
+            name(&buffer, || "hoisted indirect arguments".to_owned());
+            h.chunks.push(buffer);
+        }
+        let first = h.used == 0;
+        let buffer = h.chunks[h.used].clone();
+        h.used += 1;
+        h.at = bytes;
+        let mut barriers = vec![transition(
+            &buffer,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        )];
+        if first {
+            barriers.push(D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                ..Default::default()
+            });
+        }
+        // SAFETY: an open list and a live buffer of its own, common at the
+        // start of every recording.
+        unsafe { self.list.ResourceBarrier(&barriers) };
+        Some((buffer, 0))
+    }
+
+    /// The hoisted clamped arguments written in this recording become
+    /// readable as indirect arguments by the lists after it ([`close`]).
+    ///
+    /// [`close`]: HostList::close
+    pub(crate) fn clamp_end(&self) {
+        let used: Vec<ID3D12Resource> = {
+            let h = self.hoisted.lock().unwrap_or_else(|e| e.into_inner());
+            h.chunks[..h.used].to_vec()
+        };
+        if used.is_empty() {
+            return;
+        }
+        let barriers: Vec<_> = used
+            .iter()
+            .map(|b| {
+                transition(
+                    b,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                )
+            })
+            .collect();
+        // SAFETY: an open list and live buffers it left for unordered access.
+        unsafe { self.list.ResourceBarrier(&barriers) };
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
