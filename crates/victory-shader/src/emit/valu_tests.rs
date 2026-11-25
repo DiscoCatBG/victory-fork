@@ -181,6 +181,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
+        half_views: lowered.half_views,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -1990,6 +1991,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: Vec::new(),
+        half_views: lowered.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -2183,6 +2185,7 @@ fn cbv_narrow_buffer_loads_extract_and_sign_extend() {
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
             root_indexed_views: Vec::new(),
+            half_views: l.half_views,
         };
         #[cfg(windows)]
         for (backend, warp) in [("hardware", false), ("WARP", true)] {
@@ -2340,70 +2343,6 @@ fn glc_heap_uav_loads_stores_and_atomics_execute_on_gpu() {
         code,
     };
 
-#[test]
-fn ps_sample_coverage_input_reads_coverage_mask() {
-    use super::bitcode::{Attr, Term};
-    use super::container::{self, SigElement};
-    use super::host::Draw;
-    use super::shader::Shader;
-    use crate::dxbc::{Container, FourCC};
-
-    // SPI_PS_INPUT_ADDR bit 14 puts the sample coverage mask in v0.
-    // Convert u32 -> f32 into v1 and export mrt0 = (v1, v1, v1, v1).
-    let words = [
-        vop1(0x006, 1, vgpr(0)), // v_cvt_f32_u32 v1, v0
-        0xF800_180F,
-        0x0101_0101, // exp mrt0 v1, v1, v1, v1 done vm
-        S_ENDPGM,
-    ];
-    let native = NativeProgram {
-        stage: HwStage::Ps,
-        wave64: false,
-        vgprs: 2,
-        layout: Vec::new(),
-        used: Vec::new(),
-        io: StageIo::Ps {
-            inputs: Vec::new(),
-            input_addr: 1 << 14,
-            db_shader_control: 0,
-            patches: Vec::new(),
-        },
-        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-    };
-    // Include SV_Coverage (kind 14) in console ISG1 to verify emit() strips it
-    // (NotInSig in DXIL) while keeping SV_Target in OSG1.
-    let isg1 = container::signature(
-        &[SigElement {
-            name: "SV_Coverage".into(),
-            index: 0,
-            kind: 14,
-            comp: 5,
-            interp: 0,
-            row: None,
-            col: 0,
-            cols: 1,
-            usage: 1,
-            half: false,
-        }],
-        true,
-    );
-    let osg1 = container::signature(
-        &[SigElement {
-            name: "SV_Target".into(),
-            index: 0,
-            kind: 16,
-            comp: 9,
-            interp: 0,
-            row: Some(0),
-            col: 0,
-            cols: 4,
-            usage: 0xF,
-            half: false,
-        }],
-        false,
-    );
-    let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
-    let c = Container::parse(&bytes).expect("Container::parse");
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res =
@@ -2439,65 +2378,9 @@ fn ps_sample_coverage_input_reads_coverage_mask() {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
+        half_views: lowered.half_views,
     };
 
-    let ps = super::emit(&c, &native, &p, &st, &io, &res).expect("emit");
-
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        let mut copy = ps.dxil.clone();
-        let ours = copy[4..20].to_vec();
-        v.validate(&mut copy).expect("DXIL validation failed");
-        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
-    }
-
-    // Minimal pass-through VS: POSITION -> SV_Position.
-    let mut s = Shader::new(false);
-    let b = s.entry;
-    let undef = s.m.undef(s.t.i32);
-    for col in 0..4u8 {
-        let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), undef];
-        let v = s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
-        let out_args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), v];
-        s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &out_args);
-    }
-    s.inputs.push(SigElement {
-        name: "POSITION".into(),
-        index: 0,
-        kind: 0,
-        comp: 9,
-        interp: 0,
-        row: Some(0),
-        col: 0,
-        cols: 4,
-        usage: 0xF,
-        half: false,
-    });
-    s.outputs.push(SigElement {
-        name: "SV_Position".into(),
-        index: 0,
-        kind: 3,
-        comp: 9,
-        interp: 4,
-        row: Some(0),
-        col: 0,
-        cols: 4,
-        usage: 0xF,
-        half: false,
-    });
-    s.m.terminate(b, Term::Ret);
-    let vs = HostShader {
-        stage: HwStage::Vs,
-        dxil: s.finish(),
-        user_data: Vec::new(),
-        samplers: Vec::new(),
-        static_samplers: Vec::new(),
-        root_cbvs: Vec::new(),
-        root_srvs: Vec::new(),
-        root_uavs: Vec::new(),
-        root_indexed_views: Vec::new(),
-    };
-
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
@@ -2617,36 +2500,6 @@ fn scalar_sign_extension_preserves_scc() {
                         fallback
                     },
                     "{backend}"
-#[test]
-fn v_cmp_f_and_t_64bit_match_rdna2() {
-    use crate::dxbc::{Container, FourCC};
-
-    // v_cmp_{f,t}_{i64,u64}_e64 s6, v[1:2], v[3:4]; v_cndmask_b32_e64 v0, 0, 1, s6
-    for (op, name, want) in [
-        (0x0a0u16, "v_cmp_f_i64", 0u32),
-        (0x0a7, "v_cmp_t_i64", 1),
-        (0x0e0, "v_cmp_f_u64", 0),
-        (0x0e7, "v_cmp_t_u64", 1),
-    ] {
-        let cmp = vop3(op, 6, vgpr(1), vgpr(3), 0);
-        let sel = vop3(0x101, 0, 0x80, 0x81, sgpr(6));
-        let shader = build_valu_cs(&[cmp[0], cmp[1], sel[0], sel[1]]);
-        // Constant 64-bit compares must not require the Int64 feature bit (0x8000).
-        let host = Container::parse(&shader.dxil).expect("Container::parse");
-        let sfi0 = host.part(FourCC::SFI0).expect("SFI0").data;
-        let features = u64::from_le_bytes(sfi0.try_into().unwrap());
-        assert_eq!(
-            features & 0x8000,
-            0,
-            "{name} should not set Int64 SFI0 flag: {features:#x}"
-        );
-        run_cases(
-            &shader,
-            &[[0, 0, 0, 0], [0xFFFF_FFFF, 0x7FFF_FFFF, 1, 0x8000_0000]],
-            |backend, _, inp, got| {
-                assert_eq!(
-                    got, want,
-                    "{backend}: {name}({inp:08x?}) = {got}, want {want}"
                 );
             },
         );
@@ -2726,6 +2579,10 @@ fn movrel_masks_m0_to_8_bits_and_allows_non_vgpr_src0() {
             got, want,
             "{backend}: v_movrelsd_b32(m0={:#010x}, read={:#010x}) = {got:#x}, want {want:#x}",
             inp[0], inp[3],
+        );
+    });
+}
+
 /// SOPK `op sdst, simm16`.
 const fn sopk(op: u8, sdst: u8, simm16: i16) -> u32 {
     0xB000_0000 | (op as u32 & 0x1F) << 23 | (sdst as u32 & 0x7F) << 16 | (simm16 as u16) as u32
@@ -2837,6 +2694,182 @@ fn signed_scalar_add_sub_scc_matches_rdna2() {
             "{backend}: s_addk_i32({a}, -32768) SCC = {got}, want {want}",
         );
     });
+}
+
+#[test]
+fn v_cmp_f_and_t_64bit_match_rdna2() {
+    use crate::dxbc::{Container, FourCC};
+
+    // v_cmp_{f,t}_{i64,u64}_e64 s6, v[1:2], v[3:4]; v_cndmask_b32_e64 v0, 0, 1, s6
+    for (op, name, want) in [
+        (0x0a0u16, "v_cmp_f_i64", 0u32),
+        (0x0a7, "v_cmp_t_i64", 1),
+        (0x0e0, "v_cmp_f_u64", 0),
+        (0x0e7, "v_cmp_t_u64", 1),
+    ] {
+        let cmp = vop3(op, 6, vgpr(1), vgpr(3), 0);
+        let sel = vop3(0x101, 0, 0x80, 0x81, sgpr(6));
+        let shader = build_valu_cs(&[cmp[0], cmp[1], sel[0], sel[1]]);
+        // Constant 64-bit compares must not require the Int64 feature bit (0x8000).
+        let host = Container::parse(&shader.dxil).expect("Container::parse");
+        let sfi0 = host.part(FourCC::SFI0).expect("SFI0").data;
+        let features = u64::from_le_bytes(sfi0.try_into().unwrap());
+        assert_eq!(
+            features & 0x8000,
+            0,
+            "{name} should not set Int64 SFI0 flag: {features:#x}"
+        );
+        run_cases(
+            &shader,
+            &[[0, 0, 0, 0], [0xFFFF_FFFF, 0x7FFF_FFFF, 1, 0x8000_0000]],
+            |backend, _, inp, got| {
+                assert_eq!(
+                    got, want,
+                    "{backend}: {name}({inp:08x?}) = {got}, want {want}"
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn ps_sample_coverage_input_reads_coverage_mask() {
+    use super::bitcode::{Attr, Term};
+    use super::container::{self, SigElement};
+    use super::host::Draw;
+    use super::shader::Shader;
+    use crate::dxbc::{Container, FourCC};
+
+    // SPI_PS_INPUT_ADDR bit 14 puts the sample coverage mask in v0.
+    // Convert u32 -> f32 into v1 and export mrt0 = (v1, v1, v1, v1).
+    let words = [
+        vop1(0x006, 1, vgpr(0)), // v_cvt_f32_u32 v1, v0
+        0xF800_180F,
+        0x0101_0101, // exp mrt0 v1, v1, v1, v1 done vm
+        S_ENDPGM,
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 2,
+        layout: Vec::new(),
+        used: Vec::new(),
+        io: StageIo::Ps {
+            inputs: Vec::new(),
+            input_addr: 1 << 14,
+            db_shader_control: 0,
+            patches: Vec::new(),
+        },
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    // Include SV_Coverage (kind 14) in console ISG1 to verify emit() strips it
+    // (NotInSig in DXIL) while keeping SV_Target in OSG1.
+    let isg1 = container::signature(
+        &[SigElement {
+            name: "SV_Coverage".into(),
+            index: 0,
+            kind: 14,
+            comp: 5,
+            interp: 0,
+            row: None,
+            col: 0,
+            cols: 1,
+            usage: 1,
+            half: false,
+            packed: false,
+        }],
+        true,
+    );
+    let osg1 = container::signature(
+        &[SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+            packed: false,
+        }],
+        false,
+    );
+    let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+    let c = Container::parse(&bytes).expect("Container::parse");
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let ps = super::emit(&c, &native, &p, &st, &io, &res).expect("emit");
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = ps.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+
+    // Minimal pass-through VS: POSITION -> SV_Position.
+    let mut s = Shader::new(false);
+    let b = s.entry;
+    let undef = s.m.undef(s.t.i32);
+    for col in 0..4u8 {
+        let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), undef];
+        let v = s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+        let out_args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), v];
+        s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &out_args);
+    }
+    s.inputs.push(SigElement {
+        name: "POSITION".into(),
+        index: 0,
+        kind: 0,
+        comp: 9,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0xF,
+        half: false,
+        packed: false,
+    });
+    s.outputs.push(SigElement {
+        name: "SV_Position".into(),
+        index: 0,
+        kind: 3,
+        comp: 9,
+        interp: 4,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0xF,
+        half: false,
+        packed: false,
+    });
+    s.m.terminate(b, Term::Ret);
+    let vs = HostShader {
+        stage: HwStage::Vs,
+        dxil: s.finish(),
+        user_data: Vec::new(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
+        root_indexed_views: Vec::new(),
+        half_views: Vec::new(),
+    };
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
             .pipeline(&vs, &ps)
             .unwrap_or_else(|e| panic!("{label}: graphics pipeline failed: {e}"));
         let pixels = host
@@ -2864,4 +2897,173 @@ fn signed_scalar_add_sub_scc_matches_rdna2() {
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// A program that moves a typed buffer's 16-bit channels
+/// (`buffer_load_format_d16_xyzw` from the table's first view,
+/// `buffer_store_format_d16_xyzw` to its second) names both places for the
+/// host (`HostShader::half_views`) and moves every pattern as it is through
+/// unsigned views: half floats, the not-a-number ones among them, and
+/// plain 16-bit integers (the title keeps both in such buffers; the
+/// network that moves its faces reads indices this way). A program that
+/// moves no halves names nothing.
+#[test]
+fn halves_go_through_a_table_as_they_are_and_name_their_views() {
+    use super::host::Stride;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_UINT;
+    /// MUBUF `op vdata, vaddr, s[srsrc:srsrc+3], 0 idxen`.
+    const fn mubuf_idxen(op: u32, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+        [
+            0x38 << 26 | op << 18 | 1 << 13,
+            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+        ]
+    }
+    const LOAD_D16_XYZW: u32 = 0x83;
+    const STORE_D16_XYZW: u32 = 0x87;
+    const THREADS: u32 = 32;
+    // The table's second descriptor, 0x20 bytes on.
+    let mut second = s_load_dwordx4(12, 4);
+    second[1] |= 0x20;
+    let mut words = vec![s_mov_b32(5, 0x80)];
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.extend_from_slice(&second);
+    // v[1:2] = first[thread] (four halves), second[thread] = v[1:2].
+    words.extend_from_slice(&mubuf_idxen(LOAD_D16_XYZW, 1, 0, 8));
+    words.extend_from_slice(&mubuf_idxen(STORE_D16_XYZW, 1, 0, 12));
+    words.push(S_ENDPGM);
+    let view = |kind: ResourceType, table_offset_dwords: u32| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords,
+        lower_bound: table_offset_dwords / 8,
+        stride: 4,
+        dwords: 4,
+        user_data: 4,
+        slot: 1,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![view(ResourceType::Srv, 0), view(ResourceType::Uav, 8)],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [THREADS, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+    assert_eq!(lowered.half_views, [(1, 0), (1, 8)]);
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+        half_views: lowered.half_views,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut dxil = shader.dxil.clone();
+        v.validate(&mut dxil).expect("DXIL validation failed");
+    }
+    // A raw store through the same table: no halves, nothing named.
+    assert!(build_valu_cs(&[]).half_views.is_empty());
+
+    // Four halves a thread: numbers, both zeros, subnormals, infinities,
+    // not-a-numbers of both signs, and integers past the largest number's
+    // pattern, as indices are.
+    const SPECIAL: [u16; 16] = [
+        0x0000, 0x0001, 0x03ff, 0x0400, 0x3c00, 0x7bff, 0x7c00, 0x7c01, 0x7e00, 0x7fff, 0x8000,
+        0x8001, 0xbc00, 0xfc00, 0xfc01, 0xffff,
+    ];
+    let halves: Vec<u16> = (0..4 * THREADS as usize)
+        .map(|i| match i {
+            0..16 => SPECIAL[i],
+            _ => (i as u16).wrapping_mul(0x0203).wrapping_add(0x7b00),
+        })
+        .collect();
+    let data: Vec<u32> = halves
+        .chunks(2)
+        .map(|pair| u32::from(pair[0]) | u32::from(pair[1]) << 16)
+        .collect();
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Table, 1) => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[
+                        View::Buffer {
+                            data: &data,
+                            stride: Stride::Format(DXGI_FORMAT_R16G16B16A16_UINT, 8),
+                        },
+                        View::HalfUintUav(THREADS),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(
+            out[0], data,
+            "{label}: the halves stored are the halves loaded"
+        );
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
 }

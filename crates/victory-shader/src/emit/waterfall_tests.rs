@@ -84,6 +84,7 @@ fn build(words: &[u32], buffers: bool, nonuniform_handles: u32) -> HostShader {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: Vec::new(),
+        half_views: lowered.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -231,8 +232,6 @@ fn lanes_load_from_the_buffer_their_nested_arms_chose() {
 #[test]
 fn lanes_sample_the_entry_their_offset_names_in_the_console_waterfall() {
     use crate::resource::tests::WATERFALL_INDEXED_WAVE32;
-    let shader = build(WATERFALL_INDEXED_WAVE32, false);
-    for (label, red) in sampled(&shader) {
     let shader = build(WATERFALL_INDEXED_WAVE32, false, 1);
     let results = sampled(&shader);
     assert!(!results.is_empty());
@@ -249,8 +248,6 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
     // Lanes below 16 hold the first descriptor, the others the second.
     let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 2.0 }).collect();
     for folded in [false, true] {
-        let shader = build(&cmpx_waterfall(false, folded), false);
-        for (label, red) in sampled(&shader) {
         let shader = build(&cmpx_waterfall(false, folded), false, 1);
         let results = sampled(&shader);
         assert!(!results.is_empty());
