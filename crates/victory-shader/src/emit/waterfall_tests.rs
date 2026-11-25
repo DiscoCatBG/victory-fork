@@ -98,8 +98,6 @@ fn build(words: &[u32], buffers: bool, nonuniform_handles: u32) -> HostShader {
 /// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the
 /// hardware GPU and on WARP, returning the UAV's 32 dwords for each device
 /// that ran. At least one device must produce a readback.
-/// hardware GPU and on WARP (each skipped without a device) and returns,
-/// per one that ran, the UAV's dwords.
 fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
     let samplers = [D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
