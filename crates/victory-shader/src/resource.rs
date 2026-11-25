@@ -3926,6 +3926,9 @@ pub(crate) mod tests {
             track(&wf_p, &wf_layout, HwStage::Cs, Some(&wf_wide)).is_err(),
             "wide branch must not prune the live skip edge in lane_phi"
         );
+    }
+
+    #[test]
     fn lane_copies_refuses_mixed_lds_constant_or_non_sload_arms() {
         // Selecting per lane between a null constant descriptor (0) and an s_load
         // descriptor must not collapse to Source::Loaded and bypass waterfall tracking.
