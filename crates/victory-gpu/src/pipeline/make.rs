@@ -258,6 +258,72 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// The newest frame that has asked for a wait, and what of its budget is
+/// spent. Shared ([`shared_budget`]), the budget is counted as the time in
+/// which at least one thread waits: threads that wait at the same time
+/// share one window and end together, and one that comes later gets what
+/// is left. The first shared form handed all that was left to the first
+/// thread that waited, and any other thread that needed a pipeline
+/// meanwhile got nothing and dropped its draw at once (PalmVIDev #251:
+/// compute draws dropped while pipelines were made 1,168 -> 690 a frame on
+/// an RTX 5080). A late caller from an older frame cannot reopen it.
+#[derive(Default)]
+struct WaitBudget {
+    frame: Option<u64>,
+    /// Shared: the frame's time with a thread waiting, up to the start of
+    /// the present stretch of waiting (if any). Otherwise: the ended waits.
+    spent: Duration,
+    /// Shared: the threads of `frame` waiting now.
+    waiting: u32,
+    /// Shared: since when at least one of them has been waiting.
+    since: Option<Instant>,
+}
+
+impl WaitBudget {
+    /// The longest a wait starting at `now` may last; when it is not zero
+    /// and `shared`, the wait is counted until [`Self::finish`].
+    fn reserve(&mut self, frame: u64, budget: Duration, shared: bool, now: Instant) -> Duration {
+        if self.frame.is_some_and(|current| frame < current) {
+            return Duration::ZERO;
+        }
+        if self.frame != Some(frame) {
+            *self = Self { frame: Some(frame), ..Self::default() };
+        }
+        if !shared {
+            return budget.saturating_sub(self.spent);
+        }
+        // While this thread waits, the frame's waiting time runs on at one
+        // second per second however many wait with it, so the window ends
+        // for every thread in it when the budget is spent.
+        let running = self.since.map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
+        let left = budget.saturating_sub(self.spent + running);
+        if !left.is_zero() {
+            if self.waiting == 0 {
+                self.since = Some(now);
+            }
+            self.waiting += 1;
+        }
+        left
+    }
+
+    fn finish(&mut self, frame: u64, reserved: Duration, elapsed: Duration, shared: bool, now: Instant) {
+        if self.frame != Some(frame) {
+            // A frame that began meanwhile has its own budget.
+            return;
+        }
+        if !shared {
+            self.spent = self.spent.saturating_add(elapsed.min(reserved));
+            return;
+        }
+        self.waiting = self.waiting.saturating_sub(1);
+        if self.waiting == 0
+            && let Some(since) = self.since.take()
+        {
+            self.spent += now.saturating_duration_since(since);
+        }
+    }
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let budget = wait_budget();
@@ -273,24 +339,21 @@ fn wait(p: &Pending, frame: u64) {
     let budget = budget.max((if compute { LOADING_FRAME_COMPUTE } else { LOADING_FRAME }).min(loading));
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now).
-    static SPENTS: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
+    static SPENTS: [Mutex<WaitBudget>; 2] = [const {
+        Mutex::new(WaitBudget {
+            frame: None,
+            spent: Duration::ZERO,
+            waiting: 0,
+            since: None,
+        })
+    }; 2];
     let frame_spent = &SPENTS[usize::from(compute)];
     let shared = shared_budget();
-    let left = {
-        let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
-        if spent.0 != frame {
-            *spent = (frame, Duration::ZERO);
-        }
-        let left = budget.saturating_sub(spent.1);
-        if shared {
-            spent.1 += left;
-        }
-        left
-    };
+    let started = Instant::now();
+    let left = frame_spent.lock().unwrap_or_else(|e| e.into_inner()).reserve(frame, budget, shared, started);
     if left.is_zero() {
         return;
     }
-    let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() && !slow(p) {
@@ -308,14 +371,7 @@ fn wait(p: &Pending, frame: u64) {
     past_total.fetch_add(past.as_millis() as u64, Ordering::Relaxed);
     {
         let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
-        // A frame that began meanwhile has its own budget.
-        if spent.0 == frame {
-            if shared {
-                spent.1 = spent.1.saturating_sub(left - waited);
-            } else {
-                spent.1 += waited;
-            }
-        }
+        spent.finish(frame, left, waited, shared, Instant::now());
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
@@ -506,5 +562,47 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
         assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn old_frame_cannot_reset_newer_budget() {
+        for shared in [false, true] {
+            let ms = Duration::from_millis;
+            let t0 = Instant::now();
+            let at = |m| t0 + ms(m);
+            let mut state = WaitBudget::default();
+            let first = state.reserve(10, ms(500), shared, at(0));
+            assert_eq!(first, ms(500));
+            state.finish(10, first, ms(300), shared, at(300));
+            let next = state.reserve(11, ms(500), shared, at(300));
+            assert_eq!(next, ms(500));
+            assert_eq!(state.reserve(10, ms(500), shared, at(310)), Duration::ZERO);
+            state.finish(10, first, ms(400), shared, at(400));
+            state.finish(11, next, ms(120), shared, at(420));
+            assert_eq!(state.reserve(11, ms(500), shared, at(420)), ms(380));
+        }
+    }
+
+    /// Threads that wait at the same time share the window: one that comes
+    /// while another waits gets what is left of it, not nothing (PalmVIDev #251).
+    #[test]
+    fn shared_waiters_share_one_window() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let at = |m| t0 + ms(m);
+        let mut state = WaitBudget::default();
+        let first = state.reserve(0, ms(500), true, at(0));
+        assert_eq!(first, ms(500));
+        // A second thread 100 ms into the first one's wait: to the same end.
+        let second = state.reserve(0, ms(500), true, at(100));
+        assert_eq!(second, ms(400));
+        state.finish(0, first, ms(150), true, at(150));
+        // A third while the second still waits: still the same end.
+        let third = state.reserve(0, ms(500), true, at(200));
+        assert_eq!(third, ms(300));
+        state.finish(0, second, ms(100), true, at(200));
+        state.finish(0, third, ms(50), true, at(250));
+        // 250 ms waited (0-250), whatever the per-thread sums.
+        assert_eq!(state.reserve(0, ms(500), true, at(900)), ms(250));
     }
 }
