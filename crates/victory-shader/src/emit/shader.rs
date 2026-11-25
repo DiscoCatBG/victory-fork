@@ -538,7 +538,7 @@ impl Shader {
     }
 
     /// Refactoring lets the host fuse a multiply and an add the console
-    /// rounds apart (NVIDIA does); only `FMad` needs it, to fuse at all.
+    /// rounds apart (Intel UHD does); only `FMad` needs it, to fuse at all.
     pub(crate) fn settle_flags(&mut self) {
         if !self.fused {
             self.flags |= flags::NO_REFACTORING;
