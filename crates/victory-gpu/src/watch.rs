@@ -680,8 +680,18 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(block) {
-                // Written through the runtime, still read-only.
+                // Written through the runtime, still read-only; or through
+                // another view of its pages, which is open since
+                // ([`alias_lazy`]) and is guarded again before the caller
+                // copies.
                 g.clean.insert(block);
+                if alias_lazy() && g.aliased.contains(block) {
+                    for alias in crate::inplace::pages_of(block * BLOCK) {
+                        if alias / BLOCK != block {
+                            protect_alias(&mut g, alias / BLOCK);
+                        }
+                    }
+                }
             } else {
                 run.get_or_insert(block);
                 continue;
@@ -771,6 +781,14 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             }
         }
     }
+}
+
+/// Whether a write through one view of a guarded page leaves its other
+/// views read-only, noted written (`VICTORY_ALIAS_LAZY=0`: they are all
+/// opened, as before).
+fn alias_lazy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_LAZY").is_none_or(|v| v != "0"))
 }
 
 /// Views of one page past which its views are not guarded together.
@@ -907,6 +925,28 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         return any;
     }
     let aliased = g.aliased.in_range(start / BLOCK, end.div_ceil(BLOCK));
+    if alias_lazy() {
+        // The other views stay read-only and are only noted written: a
+        // write through one of them faults as before, and the view opened
+        // here is made read-only again when a copy next takes the pages at
+        // any view (`guard`). Opened and guarded again with it, they were
+        // most of the guards' work: a page the title writes has some 15
+        // views, and each took a call into the kernel at the write and
+        // another at the next asking, every frame (main 2649703: 5,300
+        // blocks opened and 5,200 made read-only a frame for 350 faults,
+        // 15 ms).
+        for block in aliased {
+            for alias in crate::inplace::pages_of(block * BLOCK) {
+                let alias = alias / BLOCK;
+                if alias != block && g.protected.contains(alias) && g.clean.contains(alias) {
+                    g.clean.remove(alias);
+                    #[cfg(feature = "diagnostics")]
+                    ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        return any;
+    }
     for block in aliased {
         g.aliased.remove(block);
         for alias in crate::inplace::pages_of(block * BLOCK) {
@@ -1762,6 +1802,27 @@ mod tests {
         unsafe { ((other + BLOCK + 8) as *mut u8).write(1) };
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
+        drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// A write through another view leaves that view open; the guarded
+    /// view's next check makes it read-only again, so a second write
+    /// through it is seen too (`alias_lazy`: the guarded view itself stays
+    /// read-only all along).
+    #[test]
+    fn a_second_write_through_another_view_is_reported_too() {
+        const SIZE: usize = 2 * BLOCK;
+        let (section, guarded, other) = two_views(SIZE);
+        let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
+        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
+        for round in 0..3u8 {
+            // SAFETY: the second view, read-write once the handler has opened it.
+            unsafe { ((other + BLOCK + 8) as *mut u8).write(round) };
+            // SAFETY: as above; the view is open after the first write.
+            unsafe { ((other + BLOCK + 16) as *mut u8).write(round) };
+            assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]), "round {round}");
+            assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()), "round {round}");
+        }
         drop_views(section, &[guarded, other], SIZE);
     }
 
