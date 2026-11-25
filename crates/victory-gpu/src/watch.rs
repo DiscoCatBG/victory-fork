@@ -378,15 +378,24 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 .collect(),
         ));
     }
+    // View memory the guards already hold cannot be write-watched: the
+    // kernel asking would only fail before the guards answer, and copies of
+    // it are flushed thousands of times a frame (fxceless/victory-fork#670).
+    let known = known_view(first * PAGE);
+    if known && !guarded {
+        // Nor is it asked for one who wants the write watch alone (a
+        // texture's first asking, `Texture::refresh`, which then asks
+        // again for the guards): all but a few of the 273 failed askings a
+        // frame in the run of main 22148ba were these.
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::WatchKnownView, 1);
+        return None;
+    }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // View memory the guards already hold cannot be write-watched: the
-    // kernel asking would only fail before the guards answer, and copies of
-    // it are flushed thousands of times a frame (fxceless/victory-fork#670).
-    let known = guarded && known_view(first * PAGE);
     // SAFETY: the answer buffer holds `count` entries.
     let failed = known
         || unsafe {
