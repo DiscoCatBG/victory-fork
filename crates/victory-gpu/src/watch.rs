@@ -996,6 +996,62 @@ pub fn writing(at: usize, len: usize) {
     crate::descriptor::host::remapped(at, len);
 }
 
+/// Whether our own writes into guarded title memory may go through a view
+/// of our own, the title's views staying read-only ([`aside`];
+/// `VICTORY_WRITE_ASIDE=0`: never, the guards are opened as before).
+fn write_aside() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WRITE_ASIDE").is_none_or(|v| v != "0"))
+}
+
+/// Before our own write into title memory `[at, at + len)`, in place of
+/// [`writing`]: where to write the bytes instead, a view of our own of the
+/// same pages, if every block of the range is read-only by our hand (so
+/// its pages are there). The title's views stay read-only; after the write
+/// the caller tells [`wrote_aside`]. None: the caller writes through the
+/// title's view after [`writing`], as before.
+///
+/// Opened for each write back of what shaders wrote and guarded again at
+/// the next asking, these blocks were two thirds of the blocks the guards
+/// opened in the run of main 7e88d16 (1,500 opened a frame, 420 of them
+/// for the title's own writes).
+#[allow(dead_code)] // until the writes back call it (host.rs, shadow.rs)
+pub(crate) fn aside(at: usize, len: usize) -> Option<*mut u8> {
+    if len == 0 || !write_aside() {
+        return None;
+    }
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    if guards().protected.count_range(first, last) != last - first {
+        return None;
+    }
+    crate::inplace::own_view(at, len)
+}
+
+/// After our own write of `[at, at + len)` through [`aside`]: its blocks,
+/// and the other views of their pages, are noted written (they stay
+/// read-only), as [`writing`] would have left them.
+#[allow(dead_code)] // until the writes back call it (host.rs, shadow.rs)
+pub(crate) fn wrote_aside(at: usize, len: usize) {
+    {
+        let mut g = guards();
+        let g = &mut *g;
+        for block in at / BLOCK..at.saturating_add(len).div_ceil(BLOCK) {
+            g.clean.remove(block);
+            if !g.aliased.contains(block) {
+                continue;
+            }
+            for alias in crate::inplace::pages_of(block * BLOCK) {
+                let alias = alias / BLOCK;
+                if alias != block && g.clean.contains(alias) {
+                    g.clean.remove(alias);
+                }
+            }
+        }
+    }
+    // A placed texture there changes with no descriptor written.
+    crate::descriptor::host::remapped(at, len);
+}
+
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
 /// of `section` (`crate::inplace::title_memory_view`): the view is
 /// writable, so the same bytes guarded at another view must be checked
@@ -1824,6 +1880,43 @@ mod tests {
             assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()), "round {round}");
         }
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// Our own write through a view of our own ([`aside`]): the title's
+    /// views stay read-only, the bytes show in them, and both views' next
+    /// checks report the pages written; a write of the title's afterwards
+    /// still faults and is reported.
+    #[test]
+    fn a_write_of_ours_aside_is_reported_at_every_view() {
+        const SIZE: usize = 2 * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        let pages = |view: usize, block: usize| (view + block * BLOCK) / PAGE;
+        assert_eq!(aside(one + BLOCK + 8, 16), None, "not guarded yet: written through the title's view");
+        assert_eq!(guard(one, one + SIZE), Some(vec![pages(one, 0), pages(one, 1)]));
+        assert_eq!(guard(two, two + SIZE), Some(vec![pages(two, 0), pages(two, 1)]));
+        assert_eq!(guard(one, one + SIZE), Some(Vec::new()));
+        let to = aside(one + BLOCK + 8, 16).expect("guarded, in one view");
+        // SAFETY: 16 bytes of our own view of the section.
+        unsafe { std::ptr::write_bytes(to, 0x5a, 16) };
+        wrote_aside(one + BLOCK + 8, 16);
+        // SAFETY: the title's views, readable.
+        unsafe {
+            assert_eq!(((one + BLOCK + 8) as *const u8).read(), 0x5a);
+            assert_eq!(((two + BLOCK + 23) as *const u8).read(), 0x5a);
+        }
+        assert!(!writable(one + BLOCK), "the title's view stays read-only");
+        assert_eq!(guard(two, two + SIZE), Some(vec![pages(two, 1)]));
+        assert_eq!(guard(one, one + SIZE), Some(vec![pages(one, 1)]));
+        assert_eq!(guard(one, one + SIZE), Some(Vec::new()));
+        assert_eq!(guard(two, two + SIZE), Some(Vec::new()));
+        // SAFETY: the second view, read-write once the handler has opened it.
+        unsafe { ((two + 8) as *mut u8).write(1) };
+        assert_eq!(guard(one, one + SIZE), Some(vec![pages(one, 0)]));
+        assert_eq!(guard(two, two + SIZE), Some(vec![pages(two, 0)]));
+        // Across the end of the view: not ours to write aside.
+        assert_eq!(aside(one + BLOCK, 2 * BLOCK), None);
+        crate::inplace::own_view_forget(section);
+        drop_views(section, &[one, two], SIZE);
     }
 
     /// A view of guarded pages is mapped anew: it is writable, so the

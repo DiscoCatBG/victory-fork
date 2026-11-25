@@ -400,10 +400,13 @@ struct Views {
     pages: BTreeMap<(usize, u64), Vec<usize>>,
     /// Sections by handle: bytes, and whether made committed.
     sections: Vec<(usize, u64, bool)>,
+    /// Sections by handle: where a writable view of our own of the whole
+    /// section lies ([`own_view`]); mapped when first asked for and kept.
+    own: Vec<(usize, usize)>,
 }
 
 static VIEWS: Mutex<Views> =
-    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: Vec::new() });
+    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: Vec::new(), own: Vec::new() });
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
@@ -415,6 +418,61 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     let mut v = views();
     v.sections.retain(|s| s.0 != section);
     v.sections.push((section, bytes, committed));
+    // A handle told anew is another section: our view of the old one goes.
+    forget_own(&mut v, section);
+}
+
+/// Our own view of `section` is unmapped and forgotten.
+fn forget_own(v: &mut Views, section: usize) {
+    use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+    v.own.retain(|&(handle, base)| {
+        if handle == section {
+            // SAFETY: a view we mapped ([`own_view`]) and nobody else holds.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut _ }) };
+        }
+        handle != section
+    });
+}
+
+/// [`forget_own`], for a test that closes its section.
+#[cfg(test)]
+pub(crate) fn own_view_forget(section: usize) {
+    forget_own(&mut views(), section);
+}
+
+/// The bytes the title sees at `[at, at + len)`, in a writable view of our
+/// own of their section; None if the range does not lie in one view the
+/// runtime told us of ([`title_memory_view`]), or the section cannot be
+/// mapped.
+///
+/// The title's views may be read-only by our hand (`crate::watch` guards
+/// them), and a write of ours through them must open them first, a call
+/// into the kernel per block and another to guard it again. Through this
+/// view nothing is opened. The caller knows the pages are committed (a
+/// page of a reserved section that no view committed faults here as there):
+/// [`crate::watch::aside`] answers only for blocks it made read-only.
+pub(crate) fn own_view(at: usize, len: usize) -> Option<*mut u8> {
+    use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+    let mut v = views();
+    let (&base, &(bytes, section, offset)) = v.views.range(..=at).next_back()?;
+    let within = at - base;
+    if within >= bytes || len > bytes - within {
+        return None;
+    }
+    let own = match v.own.iter().find(|o| o.0 == section) {
+        Some(o) => o.1,
+        None => {
+            // SAFETY: the runtime's section, alive while the title runs; the
+            // whole of it, address space only (its pages are the section's).
+            let mapped = unsafe { MapViewOfFile(section as *mut _, FILE_MAP_WRITE, 0, 0, 0) }.Value as usize;
+            if mapped == 0 {
+                return None;
+            }
+            v.own.push((section, mapped));
+            mapped
+        }
+    };
+    Some((own + offset as usize + within) as *mut u8)
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from
