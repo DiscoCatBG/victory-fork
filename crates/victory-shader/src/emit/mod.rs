@@ -708,6 +708,11 @@ fn emit_program(
     let pixel = native.stage == HwStage::Ps;
     let mut inputs = sig(FourCC::ISG1)?;
     let mut outputs = sig(FourCC::OSG1)?;
+    // DXIL reads SV_Coverage via `dx.op.coverage` (NotInSig); keep it out of
+    // pixel ISG1 if a console container listed it there.
+    if pixel {
+        inputs.retain(|e| e.kind != 14);
+    }
     // Interpolation as the console container's PSV0 declares it, falling back
     // to DXC's defaults when no PSV0 is present; pixel inputs that are read
     // also get the mode their barycentrics say.
