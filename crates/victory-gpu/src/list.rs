@@ -700,15 +700,22 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
                 last: u64::from(crate::host::legal_state(texture, wanted)),
             })
         }
+        // An aliasing barrier: D3D12 takes no reference on the resources a
+        // barrier names, so the list keeps the host textures alive until it
+        // is reset (PalmVIDev d3f0ad91).
         1 => Some(Barrier {
             first: if b.first.is_null() {
                 b.first
             } else {
+                let res = crate::resource::host_resource(b.first)?;
+                list.keep(res);
                 host(b.first)?
             },
             second: if b.second == 0 {
                 0
             } else {
+                let res = crate::resource::host_resource(b.second as This)?;
+                list.keep(res);
                 host(b.second as This)? as u64
             },
             ..*b
@@ -731,12 +738,34 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
                 if flags & 0x4 == 0 {
                     return None;
                 }
+                list.keep(res);
                 res.as_raw().cast_const().cast()
             },
             ..*b
         }),
         _ => None,
     }
+}
+
+/// For an unordered access barrier on a depth-stencil texture: the same
+/// barrier on its depth plane's twin, which shaders write too (the colour
+/// twin holds the stencil plane). PalmVIDev d3f0ad91 / fxceless#214.
+#[cfg(windows)]
+fn depth_plane_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
+    use windows::core::Interface;
+    if b.kind != 2 || b.first.is_null() {
+        return None;
+    }
+    let res = crate::resource::twin_plane_resource(b.first)?;
+    // SAFETY: a live D3D12 resource.
+    if unsafe { res.GetDesc() }.Flags.0 as u32 & 0x4 == 0 {
+        return None;
+    }
+    list.keep(res);
+    Some(Barrier {
+        first: res.as_raw().cast_const().cast(),
+        ..*b
+    })
 }
 
 /// An unordered access barrier on every resource: earlier shader writes
@@ -759,7 +788,8 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         let mut host: Vec<Barrier> = barriers
             .iter()
-            .filter_map(|b| host_barrier(list, b))
+            .flat_map(|b| [host_barrier(list, b), depth_plane_barrier(list, b)])
+            .flatten()
             .collect();
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
