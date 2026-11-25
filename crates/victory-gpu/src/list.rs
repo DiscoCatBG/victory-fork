@@ -966,12 +966,22 @@ extern "system" fn copy_texture_region(
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
-                return;
+            // Bytes a shader of this list writes (a dispatch encodes
+            // texture blocks into the buffer, this copy puts them into the
+            // texture) are not in title memory yet when the upload is
+            // filled at submission: they come from the memory's host copy,
+            // on the GPU, after the dispatch.
+            let buffer = if let Some(staged) = list.staged_written_source(host, data as u64, bytes) {
+                staged
+            } else {
+                let Some((buffer, staging)) = list.upload(host, bytes) else {
+                    return;
+                };
+                // The list owns this mapped D3D12 upload buffer. Wine can report
+                // its address as MEM_FREE, so use the host-upload path.
+                list.defer_fill(staging, data, bytes as usize);
+                buffer
             };
-            // The list owns this mapped D3D12 upload buffer. Wine can report
-            // its address as MEM_FREE, so use the host-upload path.
-            list.defer_fill(staging, data, bytes as usize);
             from.resource = buffer.as_raw().cast_const().cast();
             from.footprint.offset = 0;
             #[cfg(feature = "diagnostics")]

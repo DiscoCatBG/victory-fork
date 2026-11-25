@@ -3434,6 +3434,10 @@ mod late_tests {
 /// mapped now fails the joined copy as a whole (it then goes page by page,
 /// zeros for what cannot be read, as a single copy does), where before
 /// only the copy that held it did.
+/// Buffer-to-texture copies whose source this list's shaders write, staged
+/// on the GPU ([`HostList::staged_written_source`]), since the start.
+pub(crate) static STAGED_WRITTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn join_copies() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1"))
@@ -6376,6 +6380,90 @@ impl HostList {
         Some((buffer, data))
     }
 
+    /// Whether shaders of this list, as recorded so far, may write title
+    /// memory in `[address, address + len)` (a range declared with
+    /// [`HostList::defer_gpu_write`] touches it).
+    pub(crate) fn gpu_wrote(&self, address: usize, len: usize) -> bool {
+        let end = address.saturating_add(len);
+        self.deferred().copies.iter().any(|step| {
+            matches!(step, Step::GpuWrite(_, at, n) if *at < end && address < at.saturating_add(*n))
+        })
+    }
+
+    /// For a copy out of title buffer memory that this list's shaders
+    /// write (a dispatch fills a buffer, the list then copies the buffer
+    /// into a texture): a host buffer holding `[address, address + len)`
+    /// as it is at this point of the list, in the copy source state. The
+    /// bytes are copied on the GPU from the memory's host copy, after the
+    /// dispatches recorded before; the title's memory only gets them once
+    /// the list has run, so a copy filled from it at submission would take
+    /// what was there before the list. `None` if no shader of the list
+    /// writes the range, or it has no host copy: the caller then copies
+    /// from title memory as before. (PalmVIDev 4d1ce258.)
+    pub(crate) fn staged_written_source(&self, host: &Host, address: u64, len: u64) -> Option<ID3D12Resource> {
+        if len == 0 || !self.gpu_wrote(address as usize, usize::try_from(len).ok()?) {
+            return None;
+        }
+        let shadow = crate::shadow::find(address, len)?;
+        let offset = shadow.offset_in(address)?;
+        if shadow.left(address) < len {
+            return None;
+        }
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: len,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut staged: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a buffer.
+        let made = unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut staged,
+            )
+        };
+        if let Err(e) = made {
+            tracing::warn!(error = %e, len, "no buffer to stage a shader-written copy source");
+            return None;
+        }
+        let staged = staged?;
+        name(&staged, || format!("shader-written copy source {address:#x}+{len:#x}"));
+        // What the title wrote there itself reaches the host copy at
+        // submission, as for a shader that reads the range.
+        shadow.refresh(self, address, len);
+        // SAFETY: an open list; the range lies in the host copy (checked
+        // above) and the staged buffer holds `len` bytes.
+        unsafe {
+            // What shaders of this list wrote to the copy before, first.
+            self.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                ..Default::default()
+            }]);
+            self.list.CopyBufferRegion(&staged, 0, &shadow.buffer, offset, len);
+            self.list.ResourceBarrier(&[transition(
+                &staged,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+        }
+        self.keep(&staged);
+        STAGED_WRITTEN.fetch_add(1, Ordering::Relaxed);
+        Some(staged)
+    }
+
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
@@ -8176,6 +8264,52 @@ mod fill_on_card_tests {
         assert_eq!(read[512..812], pattern[512..812], "the second fill");
         // The title's memory was never read: it still holds 0xAA.
         assert!(title[64..1088].iter().all(|&b| b == 0xAA));
+        crate::shadow::unregister(resource, start);
+    }
+
+    /// A copy out of a range this list's shaders write is staged from the
+    /// host copy on the card, after what the list wrote there before (a
+    /// store into the copy stands in for the shader), not from title memory
+    /// as it was before the list (PalmVIDev 4d1ce258); a range no shader of
+    /// the list writes is not staged.
+    #[test]
+    fn a_copy_source_the_list_wrote_is_staged_from_the_host_copy() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        const LEN: usize = 1 << 16;
+        let title: &'static mut [u8] = Box::leak(vec![0x11u8; LEN].into_boxed_slice());
+        let start = title.as_ptr() as u64;
+        let resource = 0x7e57_0002usize;
+        crate::shadow::register(resource, start, LEN as u64);
+        let shadow = crate::shadow::find(start, LEN as u64).expect("a host copy");
+        let offset = shadow.offset_in(start).expect("the copy starts at the buffer");
+        let list = host.new_list().unwrap();
+        // Nothing declared written: no staging.
+        assert!(list.staged_written_source(host, start + 256, 256).is_none());
+        // The "shader" declares and writes 256 bytes of the copy.
+        list.defer_gpu_write(&shadow, start as usize + 256, 256);
+        let pattern: Vec<u8> = (0..256u32).map(|i| (i * 5 + 1) as u8).collect();
+        let (upload, data) = host.upload_buffer(256).unwrap();
+        // SAFETY: the upload buffer holds 256 mapped bytes; an open list,
+        // live buffers, ranges inside them.
+        unsafe {
+            std::ptr::copy_nonoverlapping(pattern.as_ptr(), data, 256);
+            list.list.CopyBufferRegion(&shadow.buffer, offset + 256, &upload, 0, 256);
+        }
+        let staged = list.staged_written_source(host, start + 256, 256).expect("staged");
+        let back = readback(host, 256);
+        // SAFETY: an open list; the staged buffer is in the copy source state.
+        unsafe { list.list.CopyBufferRegion(&back, 0, &staged, 0, 256) };
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copies finished (execute waits); 256 bytes.
+        let read = unsafe {
+            back.Map(0, None, Some(&mut mapped)).unwrap();
+            std::slice::from_raw_parts(mapped.cast::<u8>(), 256).to_vec()
+        };
+        assert_eq!(read, pattern, "what the list wrote, not the title's 0x11");
         crate::shadow::unregister(resource, start);
     }
 }
