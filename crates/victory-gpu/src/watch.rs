@@ -1431,6 +1431,9 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
+        // The journal is shared by the tests, and another's allocation at
+        // these addresses may have left pages written in it.
+        JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).written.retain(|page, _| !(p / PAGE..p / PAGE + 4).contains(page));
         let (_, before) = writes(start, end, false).expect("watched");
         assert!(before.is_empty());
         // SAFETY: committed pages of ours.
