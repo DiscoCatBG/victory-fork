@@ -1187,11 +1187,24 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
 }
 
 /// The staging state of a title texture, made on first use.
+/// Makes `resource`'s staging ahead of the pass over textures picked by
+/// index (`draw::State::heap_textures_ahead`), on one of several threads;
+/// true if it is there now.
+pub(crate) fn stage_ahead(resource: This, texture: &ID3D12Resource) -> bool {
+    staging(resource, texture).is_some()
+}
+
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
-    if let Some(s) = map.get(&(resource as usize)) {
-        return Some(s.clone());
+    // Looked up under the lock, made without it (an upload buffer may be
+    // made: a driver allocation, which several threads making staging
+    // ahead of the texture pass do at once), and put in under it again:
+    // one made meanwhile by another thread wins, and ours goes back to the
+    // pool as it drops.
+    {
+        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = map.as_ref().and_then(|map| map.get(&(resource as usize))) {
+            return Some(s.clone());
+        }
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
@@ -1257,8 +1270,9 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         last_upload: std::sync::atomic::AtomicU64::new(0),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
     });
-    map.insert(resource as usize, s.clone());
-    Some(s)
+    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    Some(map.entry(resource as usize).or_insert(s).clone())
 }
 
 #[cfg(test)]
