@@ -655,6 +655,8 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         // Nothing written, mapped or new since the range was last taken.
         return Some(written);
     }
+    #[cfg(feature = "diagnostics")]
+    GUARD_WORK[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let clean = g.clean.in_range(first, last);
     let mut next_clean = 0;
     let mut uncommitted_until = first;
@@ -787,6 +789,32 @@ fn view_guard() -> bool {
 #[cfg(feature = "diagnostics")]
 pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// Since the last frame line, the guards' work: calls and microseconds of
+/// making a run of blocks read-only at the view asked about, the same for
+/// one block at another view of its pages, the same for opening a block
+/// again; askings that were not wholly clean; blocks opened that were also
+/// opened in this frame or the one before (written every frame: each costs
+/// a fault and these calls each time).
+#[cfg(feature = "diagnostics")]
+static GUARD_WORK: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// [`GUARD_WORK`], and zeroes it.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn guard_work() -> [u64; 8] {
+    std::array::from_fn(|i| GUARD_WORK[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The frame each block was last opened in, for [`GUARD_WORK`].
+#[cfg(feature = "diagnostics")]
+static OPENED_IN: Mutex<std::collections::BTreeMap<usize, u64>> = Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(feature = "diagnostics")]
+fn guard_worked(at: usize, started: std::time::Instant) {
+    use std::sync::atomic::Ordering::Relaxed;
+    GUARD_WORK[at].fetch_add(1, Relaxed);
+    GUARD_WORK[at + 1].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+}
+
 /// Makes `block` read-only: another view of pages a copy has just taken
 /// through its own view, so that a write through this one faults too. It is
 /// not noted clean. The copies of title memory at this view have not taken
@@ -801,8 +829,13 @@ fn protect_alias(g: &mut Guards, block: usize) {
         return;
     }
     let mut old = 0;
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
     // SAFETY: title view memory; only its protection changes.
-    if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
+    let set = unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0;
+    #[cfg(feature = "diagnostics")]
+    guard_worked(2, started);
+    if set {
         g.protected.insert(block);
         g.views.insert(block);
     }
@@ -813,15 +846,20 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         // SAFETY: title view memory; only its protection changes.
-        unsafe {
+        let set = unsafe {
             VirtualProtect(
                 (from * BLOCK) as *const _,
                 (to - from) * BLOCK,
                 PAGE_READONLY,
                 &mut old,
             ) != 0
-        }
+        };
+        #[cfg(feature = "diagnostics")]
+        guard_worked(0, started);
+        set
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.insert_range(from, to);
@@ -890,8 +928,19 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         g.protected.remove(block);
         g.clean.remove(block);
         let mut old = 0;
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        #[cfg(feature = "diagnostics")]
+        {
+            guard_worked(4, started);
+            let frame = crate::frame::current();
+            let before = OPENED_IN.lock().unwrap_or_else(|e| e.into_inner()).insert(block, frame);
+            if before.is_some_and(|b| frame.saturating_sub(b) <= 1) {
+                GUARD_WORK[7].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
     !blocks.is_empty()
 }

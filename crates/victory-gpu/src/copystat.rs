@@ -1273,6 +1273,20 @@ pub(crate) fn log(frames: f64) {
             longest as f64 / 1e3
         );
     }
+    let work = crate::watch::guard_work().map(|n| n as f64 / frames);
+    tracing::info!(
+        "  guards' work per frame: {:.0} askings not wholly clean; {:.0} runs made read-only {:.2} ms; {:.0} blocks made \
+         read-only at another view of their pages {:.2} ms; {:.0} blocks opened {:.2} ms, {:.0} of them opened in this \
+         frame or the one before too",
+        work[6],
+        work[0],
+        work[1] / 1e3,
+        work[2],
+        work[3] / 1e3,
+        work[4],
+        work[5] / 1e3,
+        work[7]
+    );
     let failed_at = crate::watch::failed_at().map(|n| n as f64 / frames);
     tracing::info!(
         "  write-watch askings per frame: {:.0} failed in the kernel ({:.0} of runs of ranges asked together, {:.0} of \
