@@ -1342,6 +1342,21 @@ pub(crate) fn log(frames: f64) {
             })
             .collect();
         tracing::info!("  list calls by where they are recorded, per frame, the costliest first: {}", costliest.join(", "));
+        // Of those, the binds of draws and dispatches, by part.
+        let parts: Vec<String> = (0..crate::draw::BIND_PHASES)
+            .map(|i| {
+                let calls = crate::draw::BIND_TIMES[2 * i].swap(0, Relaxed);
+                let ns = crate::draw::BIND_TIMES[2 * i + 1].swap(0, Relaxed);
+                format!(
+                    "{} {:.1} ms in {:.0} ({:.1} us each)",
+                    crate::draw::BIND_NAMES[i],
+                    ns as f64 / 1e6 / frames,
+                    calls as f64 / frames,
+                    ns as f64 / 1e3 / calls.max(1) as f64
+                )
+            })
+            .collect();
+        tracing::info!("  binds of draws and dispatches per frame, all recording threads: {}", parts.join(", "));
     }
     log_memory();
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();

@@ -463,6 +463,49 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// Diagnostics: the nanoseconds and calls of `State::bind`, all of it and
+/// the parts of it that may cost (textures picked by index ahead of
+/// asking, descriptor tables with their refreshes, title memory by
+/// address, the heap's buffer views). A dispatch and an indirect execution
+/// took 22-25 microseconds each on the title's recording threads (main
+/// 9e6137f, 15,000 a frame), and a test bind takes under 2.
+#[cfg(feature = "diagnostics")]
+pub(crate) static BIND_TIMES: [AtomicU64; 2 * BIND_PHASES] = [const { AtomicU64::new(0) }; 2 * BIND_PHASES];
+#[cfg(feature = "diagnostics")]
+pub(crate) const BIND_PHASES: usize = 5;
+#[cfg(feature = "diagnostics")]
+const BIND_ALL: usize = 0;
+#[cfg(feature = "diagnostics")]
+const BIND_EARLY: usize = 1;
+#[cfg(feature = "diagnostics")]
+const BIND_TABLES: usize = 2;
+#[cfg(feature = "diagnostics")]
+const BIND_MEMORY: usize = 3;
+#[cfg(feature = "diagnostics")]
+const BIND_HEAP: usize = 4;
+/// The names of [`BIND_TIMES`]' parts, in order.
+#[cfg(feature = "diagnostics")]
+pub(crate) const BIND_NAMES: [&str; BIND_PHASES] = ["bind in all", "textures ahead", "descriptor tables", "memory by address", "heap buffer views"];
+
+/// One part of a bind, timed until dropped.
+#[cfg(feature = "diagnostics")]
+struct BindPhase(usize, std::time::Instant);
+
+#[cfg(feature = "diagnostics")]
+impl BindPhase {
+    fn start(part: usize) -> Self {
+        BindPhase(part, std::time::Instant::now())
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for BindPhase {
+    fn drop(&mut self) {
+        BIND_TIMES[2 * self.0].fetch_add(1, Ordering::Relaxed);
+        BIND_TIMES[2 * self.0 + 1].fetch_add(self.1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
 fn dropped(pipeline: usize) {
@@ -971,8 +1014,14 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        #[cfg(feature = "diagnostics")]
+        let _bind_timer = BindPhase::start(BIND_ALL);
         // Textures picked by index, before anything asks for them.
+        #[cfg(feature = "diagnostics")]
+        let phase = BindPhase::start(BIND_EARLY);
         self.early_textures(list, p, compute);
+        #[cfg(feature = "diagnostics")]
+        drop(phase);
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
@@ -1026,7 +1075,11 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            #[cfg(feature = "diagnostics")]
+            let phase = BindPhase::start(BIND_TABLES);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            #[cfg(feature = "diagnostics")]
+            drop(phase);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -1048,6 +1101,8 @@ impl State {
                     };
                     heap.and_then(|heap| crate::memory::empty(list, heap))
                 } else {
+                    #[cfg(feature = "diagnostics")]
+                    let _phase = BindPhase::start(BIND_MEMORY);
                     self.memory_ready(list, compute, writes)
                 };
                 let Some(ready) = ready else {
@@ -1103,7 +1158,12 @@ impl State {
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
-                        match self.heap_buffers(list) {
+                        #[cfg(feature = "diagnostics")]
+                        let phase = BindPhase::start(BIND_HEAP);
+                        let picked = self.heap_buffers(list);
+                        #[cfg(feature = "diagnostics")]
+                        drop(phase);
+                        match picked {
                             // SAFETY: an open list; the table lives as long
                             // as the heap the list holds.
                             Some(gpu) => unsafe {
