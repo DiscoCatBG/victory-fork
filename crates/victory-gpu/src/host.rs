@@ -2850,7 +2850,8 @@ fn handed_ready(
     // Of the copies they concern: the refreshes, their span per copy, and
     // the ranges given to shaders.
     let mut steps: Vec<(usize, usize, usize)> = Vec::new();
-    let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+    // Per copy, the disjoint ranges a flush brings up ([`Batch::add`]).
+    let mut spans: std::collections::HashMap<usize, Vec<(usize, usize)>> = std::collections::HashMap::new();
     let mut given: Vec<(usize, usize, usize)> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
@@ -2859,8 +2860,7 @@ fn handed_ready(
                     let (copy, from, to) = (ptr(shadow), *address, *address + *len);
                     if into.iter().any(|&(c, ..)| c == copy) {
                         steps.push((copy, from, to));
-                        let span = spans.entry(copy).or_insert((from, to));
-                        *span = (span.0.min(from), span.1.max(to));
+                        push_range(spans.entry(copy).or_default(), from, to);
                     }
                 }
                 Step::GpuWrite(shadow, address, len) => {
@@ -2882,15 +2882,16 @@ fn handed_ready(
     let mut after = Vec::new();
     for h in handed.iter_mut() {
         let (to, from) = (ptr(&h.to), ptr(&h.from));
-        let Some(&(first, last)) = spans.get(&to) else {
+        let Some(ranges) = spans.get(&to) else {
             continue;
         };
-        if h.address.max(first) >= h.end.min(last) {
-            continue;
-        }
         let again: Vec<(usize, usize)> =
             forwards.iter().filter(|f| Arc::ptr_eq(&f.to, &h.to)).map(|f| (f.address, f.end)).collect();
-        let parts = uncovered(h.address.max(first), h.end.min(last), &again);
+        let parts: Vec<(usize, usize)> = ranges
+            .iter()
+            .filter(|&&(first, last)| h.address.max(first) < h.end.min(last))
+            .flat_map(|&(first, last)| uncovered(h.address.max(first), h.end.min(last), &again))
+            .collect();
         if parts.is_empty() {
             continue;
         }
@@ -7610,9 +7611,12 @@ fn wide_refresh() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
 }
 
-/// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+/// A submission's refreshes not done yet, merged per buffer copy into
+/// disjoint ranges ([`push_range`]): ranges that overlap or lie within a
+/// page of each other join, distant ranges of one copy are brought up apart
+/// instead of the span between them (upstream #2428). Done before a step
+/// that writes title memory or gives a range to shaders, and before the
+/// lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
@@ -7620,7 +7624,7 @@ fn wide_refresh() -> bool {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
     /// Where each copy (by address) is in `refreshes`: the list that makes
     /// the heap's buffers ready adds some 4,100 copies, and searching them
     /// for every refresh of a submission was tens of millions of
@@ -7638,13 +7642,10 @@ impl Batch {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         match self.index.get(&key) {
-            Some(&at) => {
-                let r = &mut self.refreshes[at];
-                (r.1, r.2) = (r.1.min(address), r.2.max(end));
-            }
+            Some(&at) => push_range(&mut self.refreshes[at].1, address, end),
             None => {
                 self.index.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push((shadow.clone(), vec![(address, end)]));
             }
         }
     }
@@ -7655,12 +7656,14 @@ impl Batch {
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
         };
-        let (shadow, from, to) = self.refreshes.swap_remove(at);
+        let (shadow, ranges) = self.refreshes.swap_remove(at);
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
-        Self::update(&shadow, from, to);
+        for (from, to) in ranges {
+            Self::update(&shadow, from, to);
+        }
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
@@ -7706,7 +7709,7 @@ impl Batch {
                 .refreshes
                 .iter()
                 .filter(|r| !r.0.unwatched())
-                .map(|r| (r.1, r.2))
+                .flat_map(|r| r.1.iter().copied())
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -7720,20 +7723,47 @@ impl Batch {
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                .map(|(shadow, ranges)| {
+                    Box::new(move || {
+                        for (from, to) in ranges {
+                            Self::update(&shadow, from, to);
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
                 .collect();
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
-            for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
+            for (shadow, ranges) in self.refreshes.drain(..) {
+                for (from, to) in ranges {
+                    Self::update(&shadow, from, to);
+                }
             }
         }
         if ahead {
             crate::watch::ask_ahead_done();
         }
     }
+}
+
+/// Adds `[address, end)` to a copy's refresh ranges, kept disjoint and in
+/// order: what it overlaps, or lies within a page of, joins it (one copy
+/// is cheaper than two across a page's gap), and ranges it bridges join
+/// together. Distant ranges stay apart, so the span between them is not
+/// copied. From upstream #2428 (borosf).
+fn push_range(ranges: &mut Vec<(usize, usize)>, address: usize, end: usize) {
+    const GAP: usize = crate::watch::PAGE;
+    let (mut from, mut to) = (address, end);
+    ranges.retain(|&(a, e)| {
+        let joins = a <= to.saturating_add(GAP) && from <= e.saturating_add(GAP);
+        if joins {
+            (from, to) = (from.min(a), to.max(e));
+        }
+        !joins
+    });
+    let at = ranges.partition_point(|&(a, _)| a < from);
+    ranges.insert(at, (from, to));
 }
 
 /// Copies title memory at submission. The ranges were checked against their
@@ -9289,8 +9319,29 @@ mod duplicate_lists {
 
 #[cfg(test)]
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::{Batch, push_range};
     use std::sync::Arc;
+
+    /// A copy's refresh ranges stay disjoint: what overlaps, or lies within
+    /// a page, joins; distant ranges do not bring the span between them;
+    /// a range bridging them joins them all (upstream #2428).
+    #[test]
+    fn refresh_ranges_of_a_copy_stay_disjoint() {
+        const P: usize = crate::watch::PAGE;
+        let mut rs = vec![(0x1_0000, 0x1_1000)];
+        push_range(&mut rs, 0x40_0000, 0x40_1000);
+        assert_eq!(rs, [(0x1_0000, 0x1_1000), (0x40_0000, 0x40_1000)]);
+        // A page's gap joins ...
+        push_range(&mut rs, 0x1_1000 + P, 0x1_2000 + P);
+        assert_eq!(rs, [(0x1_0000, 0x1_2000 + P), (0x40_0000, 0x40_1000)]);
+        // ... a page and a byte more stays apart, in order.
+        push_range(&mut rs, 0x1_2000 + 2 * P + 1, 0x1_2900 + 2 * P + 1);
+        assert_eq!(rs.len(), 3);
+        assert!(rs.windows(2).all(|w| w[0].1 < w[1].0));
+        // Bridging all of them.
+        push_range(&mut rs, 0x1_3000 + P, 0x50_0000);
+        assert_eq!(rs, [(0x1_0000, 0x50_0000)]);
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {
