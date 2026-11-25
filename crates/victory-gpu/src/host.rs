@@ -1594,8 +1594,96 @@ fn card_push() -> bool {
 /// Then parts left to a later plan of the same landing that pushed them too,
 /// the runs of touching parts those merges took (one title memory read and
 /// write each), and the runs that put nothing into title memory (flagged,
-/// but what the card held there was what the CPU's side held).
-static PUSH_STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+/// but what the card held there was what the CPU's side held). Then the
+/// copies those runs were of (summed over landings) and the microseconds
+/// the merges took ([`merge_pushed`], wall time).
+static PUSH_STATS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// A run of touching parts of one copy that came down in [`card_push`]'s
+/// slots: the copy, the run's first byte in it, its parts (where each lies
+/// in the slots' mapping, its length) and the send its plan went behind.
+type PushedRun = (std::sync::Arc<crate::shadow::Shadow>, usize, Vec<(usize, usize)>, u64);
+
+/// Merges a landing's [`PushedRun`]s into title memory and returns the
+/// bytes written. With [`wide_merge`], copies are merged on several
+/// threads: each copy's runs on one thread and in their order (a copy's
+/// merges take its own lock one after another anyway), the copies spread
+/// by their bytes. The 9e6137f run spent 54 ms a frame copying back on
+/// the one thread that lands flights, merging run after run.
+///
+/// The caller gives the slots back only after this returns: every part is
+/// read by then.
+fn merge_pushed(runs: Vec<PushedRun>) -> usize {
+    if runs.is_empty() {
+        return 0;
+    }
+    let started = std::time::Instant::now();
+    fn merge_all(runs: Vec<PushedRun>) -> usize {
+        let mut title = Vec::new();
+        let mut written = 0;
+        for (shadow, lo, parts, sent_as) in runs {
+            // SAFETY: inside the slots' mapping (checked when each part was
+            // taken); the pass that filled the slots has run, and no later
+            // one takes them before the landing says they are read, which
+            // is after the caller is done.
+            let parts: Vec<&[u8]> = parts.iter().map(|&(at, n)| unsafe { std::slice::from_raw_parts(at as *const u8, n) }).collect();
+            let n = shadow.card_merge_relay(lo, &parts, sent_as, &mut title);
+            if n == 0 {
+                PUSH_STATS[5].fetch_add(1, Ordering::Relaxed);
+            }
+            PUSH_STATS[4].fetch_add(1, Ordering::Relaxed);
+            written += n;
+        }
+        written
+    }
+    // The copies, each with its runs in their order and its bytes.
+    let mut index: crate::fx::Map<usize, usize> = crate::fx::Map::default();
+    let mut copies: Vec<(usize, Vec<PushedRun>)> = Vec::new();
+    let wide = wide_merge();
+    let written = if !wide {
+        for run in &runs {
+            index.entry(std::sync::Arc::as_ptr(&run.0) as usize).or_insert(0);
+        }
+        merge_all(runs)
+    } else {
+        for run in runs {
+            let bytes: usize = run.2.iter().map(|p| p.1).sum();
+            let i = *index.entry(std::sync::Arc::as_ptr(&run.0) as usize).or_insert_with(|| {
+                copies.push((0, Vec::new()));
+                copies.len() - 1
+            });
+            copies[i].0 += bytes;
+            copies[i].1.push(run);
+        }
+        if copies.len() < 2 {
+            merge_all(copies.into_iter().flat_map(|(_, runs)| runs).collect())
+        } else {
+            // Largest first, each to the thread with the fewest bytes so far.
+            copies.sort_unstable_by_key(|c| std::cmp::Reverse(c.0));
+            let mut bins: Vec<(usize, Vec<PushedRun>)> = (0..copies.len().min(8)).map(|_| (0, Vec::new())).collect();
+            for (bytes, runs) in copies {
+                let bin = bins.iter_mut().min_by_key(|b| b.0).expect("at least two");
+                bin.0 += bytes;
+                bin.1.extend(runs);
+            }
+            let total = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = bins
+                .into_iter()
+                .map(|(_, runs)| {
+                    let total = total.clone();
+                    Box::new(move || {
+                        total.fetch_add(merge_all(runs), Ordering::Relaxed);
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+            total.load(Ordering::Relaxed)
+        }
+    };
+    PUSH_STATS[6].fetch_add(index.len() as u64, Ordering::Relaxed);
+    PUSH_STATS[7].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    written
+}
 
 /// The pass of [`card_push`]: one group of 64 threads per 4 KiB part of
 /// the range's pieces; a part whose bit the compare set in `differs` takes
@@ -1761,7 +1849,9 @@ static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atom
 /// settles: about 630 pieces and 40 MB a frame (run 104), each compared
 /// with the copy's CPU side byte by byte and put into title memory through
 /// the kernel. A piece is its own bytes of its copy and of title memory,
-/// so eight threads take an eighth of them each.
+/// so eight threads take an eighth of them each. With [`card_push`], the
+/// parts that came down in slots are merged a copy to a thread
+/// ([`merge_pushed`]).
 fn wide_merge() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
@@ -4771,6 +4861,7 @@ impl Host {
             // did. Run C's flights rewrote the same parts again and again:
             // merged from every plan, they were 294 MB a frame.
             let mut last: crate::fx::Map<(usize, usize, usize), usize> = crate::fx::Map::default();
+            let mut runs: Vec<PushedRun> = Vec::new();
             for (n, (plan, parts)) in plans.iter().zip(&parts).enumerate().rev() {
                 for &(i, lo, hi, _) in parts {
                     last.entry((std::sync::Arc::as_ptr(&plan.ranges[i].shadow) as usize, lo, hi)).or_insert(n);
@@ -4785,19 +4876,15 @@ impl Host {
                     // Parts that touch are merged as one run: they lie in
                     // the same pieces, and a run is one title memory read
                     // and one write instead of one of each per 4 KiB.
-                    let mut run: Vec<&[u8]> = Vec::new();
+                    // Noted here and merged once every plan's are
+                    // ([`merge_pushed`]), before the slots are given back.
+                    let mut run: Vec<(usize, usize)> = Vec::new();
                     let mut run_at: Option<(&std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = None;
-                    let mut merge = |run: &mut Vec<&[u8]>, run_at: &mut Option<(&std::sync::Arc<crate::shadow::Shadow>, usize, usize)>, written: &mut usize| {
+                    let merge = |run: &mut Vec<(usize, usize)>, run_at: &mut Option<(&std::sync::Arc<crate::shadow::Shadow>, usize, usize)>, runs: &mut Vec<PushedRun>| {
                         let Some((shadow, lo, _)) = run_at.take() else {
                             return;
                         };
-                        let n = shadow.card_merge_relay(lo, run, sent_as, &mut title);
-                        if n == 0 {
-                            PUSH_STATS[5].fetch_add(1, Ordering::Relaxed);
-                        }
-                        *written += n;
-                        PUSH_STATS[4].fetch_add(1, Ordering::Relaxed);
-                        run.clear();
+                        runs.push((shadow.clone(), lo, std::mem::take(run), sent_as));
                     };
                     for &(i, lo, hi, at) in parts {
                         let shadow = &plan.ranges[i].shadow;
@@ -4807,11 +4894,6 @@ impl Host {
                             PUSH_STATS[3].fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
-                        // SAFETY: inside the slots' mapping (checked when the
-                        // part was taken); the pass that filled the slot has
-                        // run, and no later one takes it before the landing
-                        // says it is read.
-                        let gpu = unsafe { std::slice::from_raw_parts(at as *const u8, hi - lo) };
                         match run_at {
                             // `Shadow::card_merge_relay` takes a run of
                             // CARD_PARTS parts at most.
@@ -4820,18 +4902,20 @@ impl Host {
                                     && end == lo
                                     && run.len() < crate::shadow::CARD_PARTS as usize => {}
                             _ => {
-                                merge(&mut run, &mut run_at, &mut written);
+                                merge(&mut run, &mut run_at, &mut runs);
                                 run_at = Some((shadow, lo, lo));
                             }
                         }
                         if let Some((_, _, end)) = &mut run_at {
                             *end = hi;
                         }
-                        run.push(gpu);
+                        // Inside the slots' mapping (checked when the part
+                        // was taken).
+                        run.push((at, hi - lo));
                         PUSH_STATS[0].fetch_add(1, Ordering::Relaxed);
                         PUSH_STATS[1].fetch_add((hi - lo) as u64, Ordering::Relaxed);
                     }
-                    merge(&mut run, &mut run_at, &mut written);
+                    merge(&mut run, &mut run_at, &mut runs);
                 }
                 let flags: Vec<(usize, u32, u32)> = plan
                     .ranges
@@ -4869,6 +4953,7 @@ impl Host {
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
                 }
             }
+            written += merge_pushed(runs);
         }
         // The pushed parts are read: their slots may be taken again. Later
         // merges need no send older than the last plan's own (a plan's
@@ -7993,13 +8078,16 @@ impl Meter {
                         "what shaders wrote to copies in the card's memory, per frame: {:.0} parts ({:.1} MB) pushed down in their own \
                          submission and merged with no fetch, {:.0} parts fetched because they found no slot (VICTORY_CARD_PUSH=0: \
                          all fetched), {:.0} pushed parts left to a later flight of the same landing that pushed them too, \
-                         merged in {:.0} runs of touching parts, {:.0} of those runs changed nothing in title memory",
+                         merged in {:.0} runs of touching parts, {:.0} of those runs changed nothing in title memory; \
+                         the runs were of {:.0} copies and took {:.1} ms (VICTORY_WIDE_MERGE=1: copies on several threads)",
                         pushed[0],
                         pushed[1] / 1e6,
                         pushed[2],
                         pushed[3],
                         pushed[4],
-                        pushed[5]
+                        pushed[5],
+                        pushed[6],
+                        pushed[7] / 1e3
                     );
                 }
             }
