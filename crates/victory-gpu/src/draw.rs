@@ -2317,6 +2317,16 @@ impl State {
             }
             // Also when the batch stopped short: its uploads are noted.
             Self::heap_textures_printed(host, prints, frame);
+            // Staging made ahead for slots the pass did not upload (it
+            // stopped short, or passed over them: no room, a texture the
+            // host writes, a slot gone) is let go, back to the pool. Kept,
+            // it was held by its texture for good: 4,310 staging buffers,
+            // 3.7 GB, after five minutes (main 2649703).
+            for resource in made.staged {
+                if crate::texture::take_ahead(resource as This) {
+                    crate::texture::unstage(resource as This);
+                }
+            }
             if stop {
                 break;
             }
@@ -2402,8 +2412,11 @@ impl State {
                     let Some(texture) = crate::resource::host_resource(resource) else {
                         return;
                     };
-                    if crate::texture::title_written(texture) && !crate::texture::is_staged(resource) {
-                        crate::texture::stage_ahead(resource, texture);
+                    if crate::texture::title_written(texture)
+                        && !crate::texture::is_staged(resource)
+                        && crate::texture::stage_ahead(resource, texture)
+                    {
+                        made.lock().unwrap_or_else(|e| e.into_inner()).staged.push(resource as usize);
                     }
                 }) as Box<dyn FnOnce() + Send>)
             })
@@ -3712,10 +3725,12 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
 
 /// What [`State::heap_textures_ahead`] found for a batch of slots: how much
 /// of each placed texture's memory is mapped (by slot: address, bytes,
-/// mapped). What it staged, `crate::texture::take_ahead` says.
+/// mapped), and the textures it staged (`crate::texture::take_ahead` says
+/// which of them the pass has not come to).
 #[derive(Default)]
 struct Ahead {
     mapped: crate::fx::Map<u32, (u64, u64, u64)>,
+    staged: Vec<usize>,
 }
 
 /// Slots per batch of [`State::heap_textures_ahead`].
