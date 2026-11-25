@@ -82,8 +82,9 @@ pub(crate) struct Shadow {
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
     /// and the bytes from the buffer's first byte to `start` (the heap
-    /// begins on a 64 KiB line; a title buffer need not).
-    place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// begins on a 64 KiB line; a title buffer need not), and for view
+    /// memory the view of ours the heap is on (`inplace::place_stretch`).
+    place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64, Option<crate::inplace::OwnView>)>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1988,8 +1989,15 @@ impl Drop for Shadow {
             // one of them may still read through it (HailLucifer666,
             // fxceless/victory-fork#943). The buffer placed in it is a field,
             // dropped after this returns, so it goes first.
-            if let Some((heap, _bias)) = self.place.take() {
-                crate::host::retire(heap);
+            // A view of ours under the heap (`inplace::place_stretch`) is
+            // unmapped only after the buffer and the heap are gone: the
+            // retired tuple holds a reference to the buffer too and drops
+            // in order.
+            if let Some((heap, _bias, own)) = self.place.take() {
+                match own {
+                    Some(own) => crate::host::retire((self.buffer.clone(), heap, own)),
+                    None => crate::host::retire(heap),
+                }
             }
             return;
         }
@@ -2531,7 +2539,7 @@ impl Shadow {
         LIVE[1].fetch_sub(len, Ordering::Relaxed);
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
-        shadow.place = Some((placed.heap, placed.bias));
+        shadow.place = Some((placed.heap, placed.bias, placed.own));
         shadow
     }
 

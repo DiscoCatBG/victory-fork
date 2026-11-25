@@ -169,6 +169,23 @@ pub(crate) struct Placed {
     pub(crate) gpu: u64,
     /// Bytes from the buffer's first byte to the title memory's first.
     pub(crate) bias: u64,
+    /// For view memory ([`place_stretch`]): the view of ours the heap was
+    /// opened on. Declared after the heap so it is unmapped after it.
+    pub(crate) own: Option<OwnView>,
+}
+
+/// A view of ours on a stretch of a title section, unmapped when dropped:
+/// after the heap opened on it ([`Placed::own`], and the tuple
+/// `crate::shadow` retires).
+pub(crate) struct OwnView(usize);
+
+impl Drop for OwnView {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        // SAFETY: a view we mapped in `place_stretch`, used by nothing now:
+        // the heap on it and its buffer went first.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.0 as *mut _ }) };
+    }
 }
 
 /// Opens the 64 KiB pages that hold title memory `[start, start + len)`
@@ -189,7 +206,73 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed { buffer, heap, gpu, bias: start - at })
+    Ok(Placed { buffer, heap, gpu, bias: start - at, own: None })
+}
+
+/// Whether view memory one run of one section long may be used in place
+/// through a view of ours ([`place_stretch`]); `VICTORY_STRETCH=0` turns it
+/// off.
+fn stretch_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STRETCH").is_none_or(|v| v != "0"))
+}
+
+/// Stretches shorter than this are copied: each one in place is a host heap.
+const STRETCH_LEAST: u64 = 1 << 20;
+
+/// Title memory the title shows page by page, in place. A title may map its
+/// streaming heaps one 64 KiB view at a time, each its own allocation,
+/// which the host cannot open as one heap, though the pages follow one
+/// another in their section (1,200 views for 75 MiB in one stretch). When
+/// the 64 KiB pages that hold `[start, start + len)` are one run of one
+/// section ([`Cover::Run`]), the run is mapped once more, whole, at an
+/// address of ours and the heap is opened there: the same pages, so nothing
+/// is copied either way, and the title's own views stay as they are. When
+/// the title maps other pages there, the copy goes as any in place does.
+///
+/// Port of Belobug 0434b3a (copy-back 36 -> 12 ms a frame on an AMD card),
+/// onto the fork's view table ([`title_memory_view`]).
+pub(crate) fn place_stretch(device: &ID3D12Device, start: u64, len: u64) -> Result<Placed, Option<windows::core::Error>> {
+    use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+    let Some((at, bytes)) = aligned_span(start, len) else {
+        return Err(None);
+    };
+    if bytes < STRETCH_LEAST {
+        return Err(None);
+    }
+    let Cover::Run(section, offset) = cover(at as usize, bytes as usize) else {
+        return Err(None);
+    };
+    // A view starts on the allocation granularity, in memory and in its
+    // section alike.
+    if !offset.is_multiple_of(K64 as u64) {
+        return Err(None);
+    }
+    // SAFETY: the runtime's section, alive while the title has views of it
+    // (and while ours stands); the stretch lies inside it.
+    let view = unsafe { MapViewOfFile(section as *mut _, FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, bytes as usize) }.Value as usize;
+    if view == 0 {
+        if STATS[5].load(Ordering::Relaxed) < 8 {
+            tracing::warn!(
+                error = %std::io::Error::last_os_error(),
+                start = format_args!("{at:#x}"),
+                bytes,
+                "a stretch of title memory could not be mapped again"
+            );
+        }
+        return Err(None);
+    }
+    let own = OwnView(view);
+    let heap = open(device, From::Part(view, bytes as usize)).map_err(Some)?;
+    let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= 32 || count.is_power_of_two() {
+        tracing::info!(count, start = format_args!("{at:#x}"), bytes, "title memory in place through a view of ours");
+    }
+    Ok(Placed { buffer, heap, gpu, bias: start - at, own: Some(own) })
 }
 
 /// What [`place_for`] asks of the runtime's switches, gathered so a test can
@@ -230,8 +313,11 @@ fn place_for_with(switches: Switches, start: u64, len: u64, window: bool) -> Opt
     if switches.level < if window { 1 } else { 2 } {
         return None;
     }
-    // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
+    // View memory: known from the runtime without asking Windows. A window
+    // over one run of one section is opened through a view of ours
+    // ([`place_stretch`]); other view memory is copied.
+    let view = cover(start as usize, len as usize) != Cover::None;
+    if view && !(window && stretch_on()) {
         STATS[4].fetch_add(1, Ordering::Relaxed);
         return None;
     }
@@ -264,7 +350,8 @@ fn place_for_with(switches: Switches, start: u64, len: u64, window: bool) -> Opt
         release(locked);
         return None;
     };
-    match place_part(&host.device, start, len) {
+    let placed = if view { place_stretch(&host.device, start, len) } else { place_part(&host.device, start, len) };
+    match placed {
         Ok(placed) => {
             let at = if window { 0 } else { 2 };
             STATS[at].fetch_add(1, Ordering::Relaxed);
