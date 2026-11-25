@@ -4296,6 +4296,7 @@ impl Host {
 
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
+        crate::census::made(8, 0);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -4662,6 +4663,15 @@ impl Host {
                 }
             }
         }
+        // Experiment (`VICTORY_SKIP_WC_COMPARE=1`, `crate::census`): copies
+        // whose declared writes all lie in write-combining title memory are
+        // left out of the hashing and the compare; nothing of them is
+        // fetched back.
+        if crate::census::skip_wc_compare() {
+            let before = declared.len();
+            declared.retain(|(_, ranges)| !crate::census::all_wc(ranges));
+            crate::census::UNCOMPARED.fetch_add((before - declared.len()) as u64, Ordering::Relaxed);
+        }
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -4716,6 +4726,11 @@ impl Host {
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                        crate::census::sent(
+                            shadow.title_start(),
+                            ranges.iter().map(|&(a, b)| (b - a) as u64).sum(),
+                            ranges.len() as u64,
+                        );
                         let Some(before) = before else {
                             continue;
                         };
@@ -5040,6 +5055,9 @@ impl Host {
                                     if lo < base || hi - base > PUSH_SLOT as usize {
                                         continue;
                                     }
+                                    if crate::census::skip_back(r.declared, (hi - lo) as u64) {
+                                        continue;
+                                    }
                                     parts.push((i, lo, hi, slots + slot as usize * PUSH_SLOT as usize + (lo - base)));
                                 }
                             }
@@ -5129,7 +5147,10 @@ impl Host {
                         // Only the 4 KiB parts flagged, each once; touching
                         // parts are fetched and merged as one.
                         for (lo, hi) in r.shadow.card_piece_parts(&r.span, p, mask) {
-                            if merged.contains(&(copy, lo, hi)) || !seen.insert((copy, lo, hi)) {
+                            if merged.contains(&(copy, lo, hi))
+                                || crate::census::skip_back(r.declared, (hi - lo) as u64)
+                                || !seen.insert((copy, lo, hi))
+                            {
                                 continue;
                             }
                             if plan.push.is_some() {
@@ -5143,6 +5164,7 @@ impl Host {
                         }
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
+                    crate::census::compared(r.shadow.title_start(), u64::from(r.span.pieces));
                 }
             }
             written += merge_pushed(runs);
@@ -5216,6 +5238,11 @@ impl Host {
             CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
+        }
+        if crate::census::on() {
+            for (shadow, lo, hi, _) in &pieces {
+                crate::census::fetched(shadow.title_start(), (hi - lo) as u64);
+            }
         }
         for (shadow, lo, hi, at) in &pieces {
             // SAFETY: the mapping of the fetched bytes, `total` of them;
@@ -5410,7 +5437,9 @@ impl Host {
                 // Only the 4 KiB parts the compare flagged, each once;
                 // touching parts are fetched and merged as one.
                 for (lo, hi) in r.shadow.card_piece_parts(&r.span, p, mask) {
-                    if !seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
+                    if crate::census::skip_back(r.declared, (hi - lo) as u64)
+                        || !seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi))
+                    {
                         continue;
                     }
                     match pieces.last_mut() {
@@ -5421,6 +5450,7 @@ impl Host {
                 }
             }
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
+            crate::census::compared(r.shadow.title_start(), u64::from(r.span.pieces));
         }
         let mut written = vec![0usize; plan.ranges.len()];
         if !pieces.is_empty() {
@@ -5464,6 +5494,11 @@ impl Host {
                 CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
                 CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
                 CARD_STATS[6].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+            if crate::census::on() {
+                for &(i, lo, hi, _) in &pieces {
+                    crate::census::fetched(plan.ranges[i].shadow.title_start(), (hi - lo) as u64);
+                }
             }
             if wide_merge() && pieces.len() >= 8 {
                 // The pieces are apart from one another (each its own bytes
@@ -8254,6 +8289,7 @@ impl Host {
     /// A buffer of `size` bytes the card writes and we read (a read back),
     /// in the state copies into it need.
     pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        crate::census::made(0, size);
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_READBACK,
             ..Default::default()
@@ -8316,6 +8352,7 @@ impl Host {
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        crate::census::made(1, size);
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -9029,6 +9066,7 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        crate::census::made(2, size);
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -9081,6 +9119,7 @@ impl Host {
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        crate::census::made(3, size);
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
