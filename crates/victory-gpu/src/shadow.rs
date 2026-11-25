@@ -793,7 +793,44 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{Flights, changed_runs, merge_piece, outside};
+    use super::{CARD_PARTS, Flights, changed_runs, merge_piece, merged_stretches, outside};
+
+    /// What a run of pushed parts writes back: each changed part's own
+    /// differing stretch, parts that touch as one write, and nothing
+    /// between a changed part and an unchanged one.
+    #[test]
+    fn a_run_of_parts_writes_back_the_stretches_the_parts_would_have() {
+        let stretches = |diffs: &[Option<(usize, usize)>], changed: &[bool]| {
+            merged_stretches(diffs, changed).collect::<Vec<_>>()
+        };
+        // Touching, both changed: one write.
+        assert_eq!(stretches(&[Some((10, 4095)), Some((4096, 5000))], &[true, true]), vec![(10, 5000)]);
+        // Touching, but the card's bytes put nothing in the second.
+        assert_eq!(stretches(&[Some((10, 4095)), Some((4096, 5000))], &[true, false]), vec![(10, 4095)]);
+        // A gap between the stretches: not joined over the title's bytes.
+        assert_eq!(
+            stretches(&[Some((10, 4000)), Some((4096, 5000))], &[true, true]),
+            vec![(10, 4000), (4096, 5000)]
+        );
+        // An unchanged part in the middle breaks the join.
+        assert_eq!(
+            stretches(&[Some((0, 4095)), Some((4096, 8191)), Some((8192, 9000))], &[true, false, true]),
+            vec![(0, 4095), (8192, 9000)]
+        );
+        assert_eq!(
+            stretches(&[Some((0, 4095)), Some((4096, 8191)), Some((8192, 9000))], &[true, true, true]),
+            vec![(0, 9000)]
+        );
+        assert!(stretches(&[Some((0, 10))], &[false]).is_empty());
+        assert!(stretches(&[None, None], &[true, true]).is_empty());
+        // The room left in the arrays a run is read into.
+        let mut diffs = [None; CARD_PARTS as usize];
+        let mut changed = [false; CARD_PARTS as usize];
+        (diffs[0], diffs[1]) = (Some((5, 9)), Some((10, 20)));
+        (changed[0], changed[1]) = (true, true);
+        assert_eq!(stretches(&diffs, &changed), vec![(5, 20)]);
+    }
+
 
     /// A range two flights declared is free only when both are done, in
     /// either order; a submission that declares it many times counts once.
@@ -3290,12 +3327,37 @@ impl Shadow {
     /// a copy has no other use for), as [`Shadow::merge_under_writes`].
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
-    pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
+    /// `parts` are the card's bytes of stretches that touch, the first at
+    /// offset `at`: part `k` holds the bytes at `at` plus the lengths of
+    /// the parts before it. At most [`CARD_PARTS`] of them.
+    ///
+    /// A part pushed down in its own submission is 4 KiB
+    /// ([`CARD_PARTS`]), and a frame of gameplay merges some 112,000 of
+    /// them (run 97). One by one, each cost a title memory read and a
+    /// write of its own, four locks and a walk of the guards, and the
+    /// submitting thread waits for the landing that does them: 100 ms a
+    /// frame of copying back against 78 MB landed. The parts of a piece
+    /// that the title's shaders wrote mostly touch, so a run of them takes
+    /// one read, one lock of each and one walk. What goes into title
+    /// memory stays the same bytes: each part is written in its own
+    /// differing stretch, and only parts that touch and both changed are
+    /// written as one (a run's untouched middle is not written over).
+    pub(crate) fn card_merge_relay(&self, at: usize, parts: &[&[u8]], fetched_after: u64, title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
         let Some(card) = &self.card else {
             return 0;
         };
-        if at + gpu.len() > self.len as usize {
+        // More than the run below holds: merged a run at a time.
+        if parts.len() > CARD_PARTS as usize {
+            let (mut written, mut at) = (0, at);
+            for run in parts.chunks(CARD_PARTS as usize) {
+                written += self.card_merge_relay(at, run, fetched_after, title);
+                at += run.iter().map(|part| part.len()).sum::<usize>();
+            }
+            return written;
+        }
+        let bytes: usize = parts.iter().map(|part| part.len()).sum();
+        if bytes == 0 || at + bytes > self.len as usize {
             return 0;
         }
         let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -3303,13 +3365,27 @@ impl Shadow {
         // range declared and not done with, which no refresh writes; what
         // does write it (the title's bytes put in under shader writes)
         // holds the lock held here.
-        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
-        let Some(first) = first_difference(gpu, held) else {
+        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), bytes) };
+        // Each part's own differing stretch, as offsets into the run, and
+        // the stretch of the whole run: outside it nothing is read, merged
+        // or written.
+        let mut diffs = [None; CARD_PARTS as usize];
+        let (mut first, mut last) = (bytes, 0);
+        let mut off = 0;
+        for (part, diff) in parts.iter().zip(&mut diffs) {
+            let side = &held[off..off + part.len()];
+            if let Some(f) = first_difference(part, side) {
+                let l = last_difference(part, side).unwrap_or(f);
+                *diff = Some((off + f, off + l));
+                first = first.min(off + f);
+                last = last.max(off + l);
+            }
+            off += part.len();
+        }
+        if first > last {
             return 0;
-        };
-        let last = last_difference(gpu, held).unwrap_or(first);
+        }
         let (at, n) = (at + first, last + 1 - first);
-        let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
         let skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
@@ -3323,20 +3399,73 @@ impl Shadow {
         title.clear();
         title.resize(n, 0);
         let mapped = crate::host::read_into((start + at) as *const u8, title);
-        let mut changed = false;
+        let mut changed = [false; CARD_PARTS as usize];
+        // The stretches to merge, each cut at the parts' edges (the card's
+        // bytes of each part lie on their own, in the slot it came down in).
         for (a, b) in outside(at, at + n, skip) {
-            let (a, b) = (a - at, b - at);
-            // Title memory that is not mapped: the CPU's side keeps what
-            // the card wrote, as before; `title` is scratch then.
-            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+            // As offsets into the run (`held`'s and the parts' own).
+            let (a, b) = (a - at + first, b - at + first);
+            let mut off = 0;
+            for (part, changed) in parts.iter().zip(&mut changed) {
+                let (from, to) = (off.max(a), (off + part.len()).min(b));
+                if from < to {
+                    // Title memory that is not mapped: the CPU's side keeps
+                    // what the card wrote, as before; `title` is scratch then.
+                    *changed |= merge_piece(
+                        &part[from - off..to - off],
+                        &mut held[from..to],
+                        &mut title[from - first..to - first],
+                    );
+                }
+                off += part.len();
+            }
         }
-        if !mapped || !changed {
+        if !mapped || !changed.contains(&true) {
             return 0;
         }
+        // The guards over these bytes are opened once for the run; the
+        // writes below are our own and do not fault into the handler.
         crate::watch::writing(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-        n
+        // Written in the differing stretches of the parts that changed,
+        // ones that touch as one write: the bytes a part by itself would
+        // have written, and no more.
+        let put = |from: usize, to: usize| {
+            let n = to + 1 - from;
+            // SAFETY (the pointer): title memory this copy's bytes map,
+            // which `writing` has opened; `title` holds the run's stretch
+            // from offset `first`.
+            crate::host::write_mapped((start + at - first + from) as *mut u8, title[from - first..].as_ptr(), n);
+            n
+        };
+        merged_stretches(&diffs, &changed).map(|(from, to)| put(from, to)).sum()
     }
+}
+
+/// The stretches of a run to write back, as offsets into it: the differing
+/// stretch (first and last byte) of each part that changed, ones that
+/// touch joined into one write. A part that did not change breaks the
+/// join: the bytes between are the title's, not ours.
+fn merged_stretches<'a>(
+    diffs: &'a [Option<(usize, usize)>],
+    changed: &'a [bool],
+) -> impl Iterator<Item = (usize, usize)> + 'a {
+    let mut stretch: Option<(usize, usize)> = None;
+    let mut parts = diffs.iter().zip(changed);
+    std::iter::from_fn(move || {
+        loop {
+            let Some((&diff, &changed)) = parts.next() else {
+                return stretch.take();
+            };
+            let Some((a, b)) = diff.filter(|_| changed) else {
+                continue;
+            };
+            match stretch.replace((a, b)) {
+                Some((from, to)) if to + 1 == a => stretch = Some((from, b)),
+                Some(before) => return Some(before),
+                None => {}
+            }
+        }
+    })
 }
 
 struct Entry {

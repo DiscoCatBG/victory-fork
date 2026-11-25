@@ -1555,9 +1555,10 @@ fn card_push() -> bool {
 /// Since the last frame-rate line, of [`card_push`]: parts merged from the
 /// slots, their bytes, parts fetched because they were not in a slot.
 /// Then parts left to a later plan of the same landing that pushed them too,
-/// and parts merged that put nothing into title memory (flagged, but what
-/// the card held there was what the CPU's side held).
-static PUSH_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+/// the runs of touching parts those merges took (one title memory read and
+/// write each), and the runs that put nothing into title memory (flagged,
+/// but what the card held there was what the CPU's side held).
+static PUSH_STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// The pass of [`card_push`]: one group of 64 threads per 4 KiB part of
 /// the range's pieces; a part whose bit the compare set in `differs` takes
@@ -4581,6 +4582,23 @@ impl Host {
                 // ones); a part a later plan pushed is left to that plan.
                 let mut merged = std::collections::HashSet::new();
                 if let Some((_, sent_as)) = plan.push {
+                    // Parts that touch are merged as one run: they lie in
+                    // the same pieces, and a run is one title memory read
+                    // and one write instead of one of each per 4 KiB.
+                    let mut run: Vec<&[u8]> = Vec::new();
+                    let mut run_at: Option<(&std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = None;
+                    let mut merge = |run: &mut Vec<&[u8]>, run_at: &mut Option<(&std::sync::Arc<crate::shadow::Shadow>, usize, usize)>, written: &mut usize| {
+                        let Some((shadow, lo, _)) = run_at.take() else {
+                            return;
+                        };
+                        let n = shadow.card_merge_relay(lo, run, sent_as, &mut title);
+                        if n == 0 {
+                            PUSH_STATS[5].fetch_add(1, Ordering::Relaxed);
+                        }
+                        *written += n;
+                        PUSH_STATS[4].fetch_add(1, Ordering::Relaxed);
+                        run.clear();
+                    };
                     for &(i, lo, hi, at) in parts {
                         let shadow = &plan.ranges[i].shadow;
                         let key = (std::sync::Arc::as_ptr(shadow) as usize, lo, hi);
@@ -4594,14 +4612,26 @@ impl Host {
                         // run, and no later one takes it before the landing
                         // says it is read.
                         let gpu = unsafe { std::slice::from_raw_parts(at as *const u8, hi - lo) };
-                        let n = shadow.card_merge_relay(lo, gpu, sent_as, &mut title);
-                        if n == 0 {
-                            PUSH_STATS[4].fetch_add(1, Ordering::Relaxed);
+                        match run_at {
+                            // `Shadow::card_merge_relay` takes a run of
+                            // CARD_PARTS parts at most.
+                            Some((before, _, end))
+                                if std::sync::Arc::ptr_eq(before, shadow)
+                                    && end == lo
+                                    && run.len() < crate::shadow::CARD_PARTS as usize => {}
+                            _ => {
+                                merge(&mut run, &mut run_at, &mut written);
+                                run_at = Some((shadow, lo, lo));
+                            }
                         }
-                        written += n;
+                        if let Some((_, _, end)) = &mut run_at {
+                            *end = hi;
+                        }
+                        run.push(gpu);
                         PUSH_STATS[0].fetch_add(1, Ordering::Relaxed);
                         PUSH_STATS[1].fetch_add((hi - lo) as u64, Ordering::Relaxed);
                     }
+                    merge(&mut run, &mut run_at, &mut written);
                 }
                 let flags: Vec<(usize, u32, u32)> = plan
                     .ranges
@@ -4714,7 +4744,7 @@ impl Host {
             // SAFETY: the mapping of the fetched bytes, `total` of them;
             // the copy into it has run.
             let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+            let merged = shadow.card_merge_relay(*lo, &[gpu], after, &mut title);
             shadow.walls_merged(gpu.len(), merged);
             written += merged;
         }
@@ -7576,12 +7606,13 @@ impl Meter {
                         "what shaders wrote to copies in the card's memory, per frame: {:.0} parts ({:.1} MB) pushed down in their own \
                          submission and merged with no fetch, {:.0} parts fetched because they found no slot (VICTORY_CARD_PUSH=0: \
                          all fetched), {:.0} pushed parts left to a later flight of the same landing that pushed them too, \
-                         {:.0} merged parts that changed nothing in title memory",
+                         merged in {:.0} runs of touching parts, {:.0} of those runs changed nothing in title memory",
                         pushed[0],
                         pushed[1] / 1e6,
                         pushed[2],
                         pushed[3],
-                        pushed[4]
+                        pushed[4],
+                        pushed[5]
                     );
                 }
             }
