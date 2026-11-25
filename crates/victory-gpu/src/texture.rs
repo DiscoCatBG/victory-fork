@@ -50,6 +50,12 @@ pub(crate) struct Staging {
     /// after `refresh` has already checked title memory for this submission.
     dirty: std::sync::atomic::AtomicBool,
     uploaded: std::sync::atomic::AtomicBool,
+    /// Whether a prelude recorded a copy out of the staging buffer that has
+    /// not been sent yet, and the fence of the last submission sent ahead
+    /// (not waited for) whose prelude copies out of it: a detile waits for
+    /// that one first ([`Staging::upload_sent`]).
+    upload_queued: std::sync::atomic::AtomicBool,
+    last_upload: std::sync::atomic::AtomicU64,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
 }
@@ -661,6 +667,21 @@ impl Staging {
         first || dirty
     }
 
+    /// A prelude recorded a copy out of the staging buffer ([`Staging::take_upload`]).
+    pub(crate) fn upload_queued(&self) {
+        self.upload_queued.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The submission whose prelude copies out of the staging buffer is
+    /// sent: with `fence` (sent ahead, not waited for) a later detile waits
+    /// for it; without (waited for) nothing is left to wait for.
+    pub(crate) fn upload_sent(&self, fence: Option<u64>) {
+        use std::sync::atomic::Ordering::AcqRel;
+        if self.upload_queued.swap(false, AcqRel) {
+            self.last_upload.store(fence.unwrap_or(0), std::sync::atomic::Ordering::Release);
+        }
+    }
+
     /// Records the copy of every subresource from the staging buffer into
     /// `texture` (which must be in `D3D12_RESOURCE_STATE_COPY_DEST`).
     pub(crate) fn record_copy(
@@ -858,6 +879,15 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        // A submission sent ahead may still be copying out of the staging
+        // buffer: detiled over now, the texture would take part of the
+        // newer contents (PalmVIDev fc836695).
+        let fence = self.last_upload.swap(0, std::sync::atomic::Ordering::AcqRel);
+        if fence != 0
+            && let Some(host) = crate::host::host()
+        {
+            host.wait_for_staging(fence);
+        }
         self.dirty.store(true, std::sync::atomic::Ordering::Release);
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
@@ -1183,6 +1213,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
+        upload_queued: std::sync::atomic::AtomicBool::new(false),
+        last_upload: std::sync::atomic::AtomicU64::new(0),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
     });
     map.insert(resource as usize, s.clone());

@@ -342,6 +342,10 @@ pub(crate) fn log_removal_context() {
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// Time detiles waited to reuse a staging buffer a submission sent ahead
+/// still copies out of (`Host::wait_for_staging`), since the last line.
+static STAGING_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// After submissions: shader-written ranges compared and copied back into
 /// title memory (microseconds, bytes that differed), since the last
 /// frame-rate line.
@@ -5123,6 +5127,36 @@ impl Host {
         working(was_working);
     }
 
+    /// A detile into a texture's staging buffer waits until submission
+    /// `target` (sent ahead, whose prelude copies out of that buffer) has
+    /// run: otherwise the texture takes part of the newer contents.
+    pub(crate) fn wait_for_staging(&self, target: u64) {
+        // SAFETY: the fence belongs to this host.
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        if completed == u64::MAX {
+            fail(format_args!("device removed while waiting to reuse texture staging"));
+        }
+        if completed >= target {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let was_working = working(false);
+        // SAFETY: `target` was signalled on the host queue when it was sent;
+        // a null event waits inline.
+        let waited = unsafe { self.fence.SetEventOnCompletion(target, HANDLE::default()) };
+        working(was_working);
+        if let Err(error) = waited {
+            fail(format_args!("could not wait to reuse texture staging ({error})"));
+        }
+        // SAFETY: a plain query; device removal can also end the wait.
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        if completed == u64::MAX || completed < target {
+            fail(format_args!("texture staging upload did not reach fence {target}"));
+        }
+        stood(started);
+        STAGING_WAIT_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+
     /// [`Host::execute`], or with `late` the first half of
     /// [`Host::execute_late`]: the lists are prepared and sent, and what is
     /// to be done once they have run comes back with the submission lock
@@ -5312,6 +5346,13 @@ impl Host {
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
+            // Staging buffers these lists' preludes copy out of: a detile
+            // into one waits for this submission (PalmVIDev fc836695).
+            for list in runs {
+                for (_, staging) in &list.deferred().texture_uploads {
+                    staging.upload_sent(Some(*submitted));
+                }
+            }
             let back = declared_writes(runs);
             let backs: Vec<(usize, usize)> = runs
                 .iter()
@@ -5355,6 +5396,13 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        // Waited for below, under the submission lock: no detile can come
+        // between, so nothing is left to wait for.
+        for list in runs {
+            for (_, staging) in &list.deferred().texture_uploads {
+                staging.upload_sent(None);
+            }
+        }
         submitting(2, runs.len());
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
@@ -6040,6 +6088,9 @@ impl HostList {
                     if staging.take_upload() {
                         #[cfg(feature = "diagnostics")]
                         crate::copystat::add(crate::copystat::C::TexUploads, 1);
+                        // A later detile waits for this copy if the
+                        // submission is sent ahead (`Staging::upload_sent`).
+                        staging.upload_queued();
                         Some((copy.clone(), staging.clone()))
                     } else {
                         #[cfg(feature = "diagnostics")]
@@ -7242,11 +7293,13 @@ impl Meter {
         {
             let [own, asking, still, all] =
                 [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+            let staging = STAGING_WAIT_US.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames;
             if all >= 1.0 {
                 tracing::info!(
                     "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
                      is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
-                     hold still (the runtime remapping it); the rest is reading, hashing and detiling"
+                     hold still (the runtime remapping it), {staging:.1} ms waiting for a staging buffer a submission sent ahead \
+                     still copies out of; the rest is reading, hashing and detiling"
                 );
             }
             let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
