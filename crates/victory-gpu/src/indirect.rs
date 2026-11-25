@@ -1353,7 +1353,7 @@ void main() {
                     assert!(record_clamp_as(
                         &warp.clamp,
                         &warp.list,
-                        &dst,
+                        (&dst, D3D12_RESOURCE_STATE_COMMON),
                         budget_gpu,
                         (&src_buf, call.offset),
                         count,
@@ -2723,16 +2723,24 @@ void main() {
             src_u32.add(tail + 2).write_volatile(1);
         }
 
-        assert!(record_clamp(
+        assert!(record_clamp_as(
             &h.clamp,
             &h.list,
-            &dst_buf,
+            (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
             budget_gpu,
             (&src_buf, 0),
             Some((&count_buf, 0)),
             (2, STRIDE, RECORDS),
+            false,
         ));
-        done_on(&h.list, &dst_buf);
+        // SAFETY: an open list; the clamp left `dst_buf` readable as arguments.
+        unsafe {
+            h.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
         h.submit_and_wait();
 
         // SAFETY: GPU finished; querying device health and reading back clamped records.
