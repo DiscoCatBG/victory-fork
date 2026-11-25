@@ -67,6 +67,7 @@ fn target() -> SigElement {
         cols: 4,
         usage: 0xF,
         half: false,
+        packed: false,
     }
 }
 
@@ -127,6 +128,7 @@ fn vertex_shader() -> HostShader {
         cols: 4,
         usage: 0xF,
         half: false,
+        packed: false,
     };
     s.inputs.push(element("POSITION", 0, 0));
     s.outputs.push(element("SV_Position", 3, 4));
