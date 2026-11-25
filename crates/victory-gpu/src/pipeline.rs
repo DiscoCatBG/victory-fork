@@ -279,10 +279,13 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
 /// submission, on pointers that had become bounding-box bit patterns).
 ///
 /// So a builder dispatch runs only while every builder pipeline the title
-/// has created has a host pipeline; the first builder dispatch makes them
-/// all on the spot instead of over the next frames (a stage "still being
-/// made" would be a dropped stage). One that cannot be made turns the
-/// builder off for the rest of the run.
+/// has created has a host pipeline; the first builder dispatch asks the
+/// workers for them all (ahead of the rest) and the builder does not run,
+/// none of its stages, until none is still being made (a stage "still being
+/// made" would be a dropped stage). It no longer makes them on the spot:
+/// that held the title's recording thread for minutes (PalmVIDev #255).
+/// One that cannot be made turns the builder off for the rest of the run
+/// (`VICTORY_BVH_BUILDER=2`: at the first of those dispatched).
 ///
 /// shortcut: and only with `VICTORY_BVH_BUILDER=1`, until a run has shown
 /// the whole builder and the host side of title memory by address
@@ -291,8 +294,11 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
 #[cfg(windows)]
 struct Builder {
     pipelines: Vec<Arc<make::Pending>>,
-    /// Every one of `pipelines` has a host pipeline.
+    /// `pipelines` have been looked at since the last was created: each
+    /// has a host pipeline, or `partial`.
     whole: bool,
+    /// Some of `pipelines` have no host pipeline (`VICTORY_BVH_BUILDER=2`).
+    partial: bool,
     /// One could not be made.
     off: bool,
 }
@@ -301,8 +307,17 @@ struct Builder {
 static BUILDER: Mutex<Builder> = Mutex::new(Builder {
     pipelines: Vec::new(),
     whole: false,
+    partial: false,
     off: false,
 });
+
+/// Whether the builder waits for its pipelines ([`make::poll`] of each):
+/// some are still being made. Refused ones do not count: those decide
+/// whether it runs at all.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn builder_waits(states: &[Option<bool>]) -> bool {
+    states.iter().any(Option::is_none)
+}
 
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
@@ -467,12 +482,27 @@ pub(crate) fn builder_off(why: &'static str) {
     }
 }
 
-/// At a dispatch of a builder pipeline: whether the builder runs (see
-/// [`Builder`]).
+/// At a dispatch of the builder pipeline `this` (or, with `None`, asked
+/// outside one): whether the builder runs (see [`Builder`]).
+///
+/// `VICTORY_BVH_BUILDER=2` asks less (PalmVIDev #249): the builder also
+/// runs while some of its pipelines have no host pipeline, until the title
+/// dispatches one of those; that stage is the first dropped one, and none
+/// runs from there on. The title creates every program of the builder
+/// library, also the ones its scenes never dispatch, so one of those that
+/// does not translate keeps the whole builder off under `=1`.
+/// shortcut: what the stages before the dropped one stored stays in title
+/// memory (unless `VICTORY_BVH_QUARANTINE=1`, where there is one): whole
+/// stages' results, but of a build that never finished.
 #[cfg(windows)]
-pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+pub(crate) fn builder_runs(this: Option<This>) -> bool {
+    static ALLOWED: OnceLock<u8> = OnceLock::new();
+    let allowed = *ALLOWED.get_or_init(|| match std::env::var("VICTORY_BVH_BUILDER").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    });
+    if allowed == 0 {
         #[cfg(feature = "diagnostics")]
         builder_census();
         return false;
@@ -481,26 +511,52 @@ pub(crate) fn builder_runs() -> bool {
     if b.off {
         return false;
     }
-    if b.whole {
-        return true;
+    if !b.whole {
+        // Asked for and not waited for: making them all here, on the
+        // title's recording thread under this lock, froze a world run's
+        // frame for 5 minutes (53 programs, seconds of driver compile each).
+        // The builder stays off, all of it, until none is being made.
+        let states: Vec<Option<bool>> = b.pipelines.iter().map(make::poll).collect();
+        if builder_waits(&states) {
+            static WAITING: std::sync::Once = std::sync::Once::new();
+            WAITING.call_once(|| {
+                tracing::info!(
+                    pipelines = states.len(),
+                    making = states.iter().filter(|s| s.is_none()).count(),
+                    "the ray-tracing structure builder waits for its programs' host pipelines (made by the workers, ahead of the rest)"
+                );
+            });
+            return false;
+        }
+        let missing = states.iter().filter(|s| **s != Some(true)).count();
+        if missing > 0 && allowed == 1 {
+            b.off = true;
+            BUILDER_LIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                missing,
+                of = b.pipelines.len(),
+                "the ray-tracing structure builder stays off: not all of its programs have a host pipeline, and its stages run all or none"
+            );
+            return false;
+        }
+        tracing::info!(
+            pipelines = b.pipelines.len(),
+            missing,
+            "the ray-tracing structure builder runs: its programs have host pipelines (but for the missing ones: it stops at the first of those the title dispatches)"
+        );
+        b.whole = true;
+        b.partial = missing > 0;
+        BUILDER_LIVE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
-    if missing > 0 {
+    if b.partial && this.is_some_and(|this| !make::now(&pipeline(this).host)) {
         b.off = true;
         BUILDER_LIVE.store(false, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(
-            missing,
-            of = b.pipelines.len(),
-            "the ray-tracing structure builder stays off: not all of its programs have a host pipeline, and its stages run all or none"
+            frame = crate::frame::current(),
+            "the ray-tracing structure builder is turned off for the rest of the run: the title dispatched a stage that has no host pipeline, and its stages run all or none"
         );
         return false;
     }
-    tracing::info!(
-        pipelines = b.pipelines.len(),
-        "the ray-tracing structure builder runs: all of its programs have host pipelines"
-    );
-    b.whole = true;
-    BUILDER_LIVE.store(true, std::sync::atomic::Ordering::Relaxed);
     true
 }
 
@@ -953,6 +1009,17 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+    /// The builder waits (does not run, and is not turned off) while any of
+    /// its pipelines is still being made; made and refused ones decide.
+    #[test]
+    fn the_builder_waits_for_pipelines_being_made() {
+        assert!(super::builder_waits(&[Some(true), None, Some(true)]));
+        assert!(super::builder_waits(&[None, Some(false)]));
+        assert!(!super::builder_waits(&[Some(true), Some(true)]));
+        assert!(!super::builder_waits(&[Some(true), Some(false)]));
+        assert!(!super::builder_waits(&[]));
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {

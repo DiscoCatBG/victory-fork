@@ -226,6 +226,19 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     p.made.get()?.as_ref()
 }
 
+/// Without waiting: `Some(true)` if `p` has a host pipeline, `Some(false)`
+/// if it was refused (or left out), `None` while it is being made (asked
+/// for now, ahead of everything no draw or dispatch asked for).
+pub(crate) fn poll(p: &Arc<Pending>) -> Option<bool> {
+    if p.left_out.is_some() {
+        return Some(false);
+    }
+    if p.made.get().is_none() {
+        start(p, REQUESTED);
+    }
+    p.made.get().map(Option::is_some)
+}
+
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
