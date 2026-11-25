@@ -1224,7 +1224,7 @@ fn root_signature(
 }
 
 #[cfg(test)]
-mod tests {
+mod root_flag_tests {
     use super::*;
 
     #[test]
