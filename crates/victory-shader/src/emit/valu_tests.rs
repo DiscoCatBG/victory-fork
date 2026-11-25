@@ -1840,7 +1840,9 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
                 out[0][0],
                 want.to_bits(),
             );
+        }
     }
+}
 
 /// MUBUF `buffer_load_*` with `offen = 1`, `soffset = 0`, `offset = 0`.
 const fn mubuf_load_offen(op: u8, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
@@ -2253,7 +2255,6 @@ fn glc_heap_uav_loads_stores_and_atomics_execute_on_gpu() {
         "expected both hardware GPU and WARP to run, got {ran}"
     );
 }
-    }
 
 #[test]
 fn scalar_sign_extension_preserves_scc() {

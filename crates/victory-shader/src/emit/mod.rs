@@ -2492,6 +2492,7 @@ mod barycentric_tests {
             cols: 1,
             usage: 1,
             half: false,
+            packed: false,
         };
         let u_flat = SigElement {
             name: "TEXCOORD".into(),
@@ -2504,6 +2505,7 @@ mod barycentric_tests {
             cols: 1,
             usage: 0,
             half: false,
+            packed: false,
         };
         let target = SigElement {
             name: "SV_Target".into(),
@@ -2516,6 +2518,7 @@ mod barycentric_tests {
             cols: 4,
             usage: 0xF,
             half: false,
+            packed: false,
         };
         let isg1 = super::container::signature(&[f_flat.clone(), u_flat.clone()], true);
         let osg1 = super::container::signature(std::slice::from_ref(&target), false);
