@@ -1144,7 +1144,9 @@ mod tests {
             }
             assert_eq!(blocks.is_empty(), set.is_empty());
         }
-        assert_eq!(blocks.in_range(0, 3 * CHUNK), set.into_iter().collect::<Vec<_>>());
+        // Past the range the blocks were drawn from: a range insert of
+        // the last of them reaches a little beyond it.
+        assert_eq!(blocks.in_range(0, 4 * CHUNK), set.into_iter().collect::<Vec<_>>());
     }
 
     use windows_sys::Win32::System::Memory::{
