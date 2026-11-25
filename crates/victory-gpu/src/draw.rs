@@ -2256,7 +2256,8 @@ impl State {
                 // through a table: they upload it, and check it at every
                 // submission that samples it.
                 // (A staging made ahead for this pass is not a table's.)
-                let tabled = crate::texture::is_staged(resource) && !made.staged.contains(&(resource as usize));
+                let ahead = crate::texture::take_ahead(resource);
+            let tabled = crate::texture::is_staged(resource) && !ahead;
                 if let Some(view) = &view {
                     #[cfg(feature = "diagnostics")]
                     let _phase = BindPhase::start(BIND_PASS_STAGE);
@@ -2401,11 +2402,8 @@ impl State {
                     let Some(texture) = crate::resource::host_resource(resource) else {
                         return;
                     };
-                    if crate::texture::title_written(texture)
-                        && !crate::texture::is_staged(resource)
-                        && crate::texture::stage_ahead(resource, texture)
-                    {
-                        made.lock().unwrap_or_else(|e| e.into_inner()).staged.insert(resource as usize);
+                    if crate::texture::title_written(texture) && !crate::texture::is_staged(resource) {
+                        crate::texture::stage_ahead(resource, texture);
                     }
                 }) as Box<dyn FnOnce() + Send>)
             })
@@ -3712,13 +3710,12 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     }
 }
 
-/// What [`State::heap_textures_ahead`] made for a batch of slots: how much
+/// What [`State::heap_textures_ahead`] found for a batch of slots: how much
 /// of each placed texture's memory is mapped (by slot: address, bytes,
-/// mapped), and the textures it staged.
+/// mapped). What it staged, `crate::texture::take_ahead` says.
 #[derive(Default)]
 struct Ahead {
     mapped: crate::fx::Map<u32, (u64, u64, u64)>,
-    staged: crate::fx::Set<usize>,
 }
 
 /// Slots per batch of [`State::heap_textures_ahead`].

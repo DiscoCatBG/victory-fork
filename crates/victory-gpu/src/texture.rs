@@ -606,6 +606,8 @@ pub(crate) fn forget(resource: usize) {
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
     }
+    drop(map);
+    take_ahead(resource as This);
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
         set.remove(&resource);
@@ -933,6 +935,8 @@ pub(crate) fn unstage(resource: This) {
     if let Some(map) = map.as_mut() {
         map.remove(&(resource as usize));
     }
+    drop(map);
+    take_ahead(resource);
 }
 
 /// Where a staged title texture's memory is: address and bytes, and the
@@ -1191,7 +1195,25 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
 /// index (`draw::State::heap_textures_ahead`), on one of several threads;
 /// true if it is there now.
 pub(crate) fn stage_ahead(resource: This, texture: &ID3D12Resource) -> bool {
-    staging(resource, texture).is_some()
+    let made = staging(resource, texture).is_some();
+    if made {
+        AHEAD.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(resource as usize);
+    }
+    made
+}
+
+/// Textures whose staging [`stage_ahead`] made and the pass has not come
+/// to yet: their staging is the pass's, not a table's. Kept from pass to
+/// pass: a pass that stops short (out of time or bytes) leaves the rest of
+/// its batch to the next one, which took such a staging for a table's,
+/// uploaded the texture without counting it and never looked at it again,
+/// and left the staging held.
+static AHEAD: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+
+/// Whether `resource`'s staging was made ahead of the pass ([`stage_ahead`]),
+/// noting the pass has come to it.
+pub(crate) fn take_ahead(resource: This) -> bool {
+    AHEAD.lock().unwrap_or_else(|e| e.into_inner()).as_mut().is_some_and(|set| set.remove(&(resource as usize)))
 }
 
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
