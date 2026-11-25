@@ -6006,7 +6006,18 @@ impl<'a> Lower<'a> {
         (first, props, image, uav, used)
         };
         let src = Source::Loaded { load: site, first };
-        let h = self.handle(site, &src, false, props)?;
+        // AMD's DXIL compiler (`amdxc64.dll+0x861b9f`) dereferences null when
+        // lowering `dx.op.getDimensions` on some heap-indexed `ByteAddressBuffer`
+        // handles marked uniform (`nonUniformIndex = false`). Emit a separate
+        // non-uniform handle for buffer `getDimensions` without caching it in
+        // `self.handles` so normal buffer loads/stores stay uniform.
+        let per_lane = self.x.res.waterfall.loads.contains(&site);
+        let h = if image.is_none() && !per_lane {
+            let index = self.heap_index(site, first, false)?;
+            self.s.heap_handle_for_buffer_dim(self.cur, index, props)
+        } else {
+            self.handle(site, &src, false, props)?
+        };
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
@@ -12230,12 +12241,14 @@ mod tests {
             vec![
                 (0x100B, 0),    // UAV @ 0 handle (descriptor_data + load + store)
                 (0x000B, 0),    // read-only SRV @ 1 handle (descriptor_data + load)
+                (0x100B, 0),    // getDimensions of UAV @ 0: a handle of its own (fxceless#452)
                 (0x500B, 0),    // buffer_load_dword glc on UAV @ 0
                 // s_buffer_load_dword on read-only @ 2: no used-resource
                 // entry, so the fork reads it as a buffer the program picks
                 // (raw where the host's stride table says buffer, else a
                 // constant buffer).
                 (0x000B, 0),
+                (0x000B, 0), // getDimensions of read-only @ 1: a handle of its own (fxceless#452)
                 (13, 0x1_0000),
                 (0x500B, 0), // s_buffer_load_dword glc on reloaded UAV @ 0
                 (0x100B, 0), // s_buffer_load_dword on reloaded UAV @ 0
@@ -12373,6 +12386,7 @@ mod tests {
                 (0x500A, 0x409), // typed UAV glc (shared by load and store)
                 (0x5002, 0x409), // 2D image UAV glc (shared by load and store)
                 (0x5002, 0x105), // 2D uint image atomic glc
+                (0x000B, 0),     // getDimensions of the table SRV: a handle of its own (fxceless#452)
             ]
         );
     }
