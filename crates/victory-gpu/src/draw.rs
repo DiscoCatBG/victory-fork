@@ -474,7 +474,7 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "diagnostics")]
 pub(crate) static BIND_TIMES: [AtomicU64; 2 * BIND_PHASES] = [const { AtomicU64::new(0) }; 2 * BIND_PHASES];
 #[cfg(feature = "diagnostics")]
-pub(crate) const BIND_PHASES: usize = 5;
+pub(crate) const BIND_PHASES: usize = 9;
 #[cfg(feature = "diagnostics")]
 const BIND_ALL: usize = 0;
 #[cfg(feature = "diagnostics")]
@@ -485,9 +485,32 @@ const BIND_TABLES: usize = 2;
 const BIND_MEMORY: usize = 3;
 #[cfg(feature = "diagnostics")]
 const BIND_HEAP: usize = 4;
+// Inside the descriptor tables (main 5adccfe: 10-29 microseconds a bind,
+// most of each bind): a title slot's host view brought up to date, a
+// buffer view's refresh (and its copy-back when shaders write it), a
+// texture view's upload and state, and the tables made afresh in dynamic
+// slots (whose views are counted in the others too).
+#[cfg(feature = "diagnostics")]
+const BIND_MIRROR: usize = 5;
+#[cfg(feature = "diagnostics")]
+const BIND_BUFFERS: usize = 6;
+#[cfg(feature = "diagnostics")]
+const BIND_TEXTURES: usize = 7;
+#[cfg(feature = "diagnostics")]
+const BIND_FRESH: usize = 8;
 /// The names of [`BIND_TIMES`]' parts, in order.
 #[cfg(feature = "diagnostics")]
-pub(crate) const BIND_NAMES: [&str; BIND_PHASES] = ["bind in all", "textures ahead", "descriptor tables", "memory by address", "heap buffer views"];
+pub(crate) const BIND_NAMES: [&str; BIND_PHASES] = [
+    "bind in all",
+    "textures ahead",
+    "descriptor tables",
+    "memory by address",
+    "heap buffer views",
+    "(tables) title slots mirrored",
+    "buffer views refreshed (in tables and out)",
+    "texture views readied (in tables and out)",
+    "(tables) tables made afresh",
+];
 
 /// One part of a bind, timed until dropped.
 #[cfg(feature = "diagnostics")]
@@ -2694,7 +2717,12 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
+        #[cfg(feature = "diagnostics")]
+        let phase = BindPhase::start(BIND_MIRROR);
+        let mirrored = host.mirror(index, handle, true);
+        #[cfg(feature = "diagnostics")]
+        drop(phase);
+        if let Some(view) = mirrored {
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
@@ -2757,6 +2785,8 @@ impl State {
             }
         }
         let mut made = Vec::new();
+        #[cfg(feature = "diagnostics")]
+        let _phase = (!fresh.is_empty()).then(|| BindPhase::start(BIND_FRESH));
         for slot in fresh {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
@@ -3427,6 +3457,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
+    #[cfg(feature = "diagnostics")]
+    let phase = BindPhase::start(BIND_BUFFERS);
     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
         shadow.refresh(list, address, len);
         if kind == ResourceType::Uav {
@@ -3446,6 +3478,10 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             list.buffer_read(&shadow.buffer);
         }
     }
+    #[cfg(feature = "diagnostics")]
+    drop(phase);
+    #[cfg(feature = "diagnostics")]
+    let _phase = BindPhase::start(BIND_TEXTURES);
     match (view, kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
             // A view the title placed, in another format, in the memory of
