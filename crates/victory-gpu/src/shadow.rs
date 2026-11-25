@@ -168,28 +168,59 @@ fn card_limits() -> (u64, u64) {
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
-/// The card's memory still kept for copies of title buffers
-/// (`VICTORY_CARD_RESERVE=1`; off by default): the most `card_limits`
-/// allows, less what the copies alive take. A buffer gets its card copy
+/// The card's memory still kept for copies of title buffers not made yet
+/// (on by default; `VICTORY_CARD_RESERVE=0` or
+/// `VICTORY_CARD_ROOM_FOR_BUFFERS=0`: off, as before): the most
+/// `card_limits` allows, less what the copies alive take and what was
+/// turned down ([`CARD_REFUSED`]). A buffer gets its card copy
 /// the first time it is used, and never later: once the textures picked
 /// by index had filled the card to its share (`resource::room`), every big
 /// buffer first used after that stayed in the PC's memory, and what
 /// shaders wrote to it was looked for on the CPU (600-780 MB a frame
 /// against 24 with the copies on the card, frames twice as long). With the
-/// switch the textures leave this much of the card free
-/// (`resource::room`), and a copy may take the card up to the textures'
-/// share rather than four fifths of it ([`card_for`]).
+/// reserve the textures leave this much of the card free
+/// (`resource::room`), and a copy may take the card up to 97 hundredths of
+/// its budget rather than four fifths of it ([`card_for`]): its room was
+/// kept.
+///
+/// After fxceless/victory-gta6 a26859fc (PalmVIDev #170), which made it the
+/// default there: 98 buffer copies made (945 MB) at the world's first frame
+/// where earlier runs made 1, and 25 MB a frame compared on the processor
+/// where it was 550 to 710. A copy turned down gives its room up (it is not
+/// asked for again, and its room was otherwise kept to the end of the run).
 pub(crate) fn card_reserve() -> u64 {
     if !cards() || !card_reserve_on() {
         return 0;
     }
-    card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed))
+    reserve_left(card_limits().1, CARD_BYTES[0].load(Ordering::Relaxed), CARD_REFUSED[1].load(Ordering::Relaxed))
+}
+
+/// What is kept of `most`, with `made` bytes of copies alive and `refused`
+/// bytes of copies turned down ([`card_reserve`]).
+fn reserve_left(most: u64, made: u64, refused: u64) -> u64 {
+    most.saturating_sub(made.saturating_add(refused))
 }
 
 fn card_reserve_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_RESERVE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        reserve_on_from(
+            std::env::var("VICTORY_CARD_RESERVE").ok().as_deref(),
+            std::env::var("VICTORY_CARD_ROOM_FOR_BUFFERS").ok().as_deref(),
+        )
+    })
 }
+
+/// [`card_reserve_on`] from its two switches: on unless either says `0`.
+fn reserve_on_from(reserve: Option<&str>, room_for_buffers: Option<&str>) -> bool {
+    ![reserve, room_for_buffers].into_iter().flatten().any(|v| v.trim() == "0")
+}
+
+/// Title buffers big enough for a copy in the card's memory that were
+/// turned down for want of room, since the start, and their bytes: their
+/// copies stay in the PC's memory for as long as the title keeps the
+/// buffers, so no room is kept for them any more ([`card_reserve`]).
+static CARD_REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
@@ -281,12 +312,31 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     // queue's own rule (`resource::room`: nine tenths of the budget) counts
     // them, so the card's use stays where it was and the textures' share
     // shrinks by the copies' bytes, at most `card_limits`' second number.
-    // With the reserve the textures left room for the copies: up to the
-    // textures' own share of the budget.
-    let share = if card_reserve_on() { crate::resource::room_share() } else { 80 };
+    // With the reserve ([`card_reserve`], on by default) the textures left
+    // room for the copies: up to 97 hundredths of the budget (a26859fc; the
+    // textures' own share, as before, if that is more).
+    let share = if card_reserve_on() { crate::resource::room_share().max(97) } else { 80 };
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 100 * share
     {
+        // Said, with the numbers it was decided by: the first 64, then
+        // every 32nd. Its room is given up ([`CARD_REFUSED`]).
+        let n = CARD_REFUSED[0].fetch_add(1, Ordering::Relaxed) + 1;
+        let bytes = CARD_REFUSED[1].fetch_add(size, Ordering::Relaxed) + size;
+        if n <= 64 || n.is_multiple_of(32) {
+            tracing::info!(
+                "no card copy for a title buffer of {} KiB: the card has {} MB in use of a budget of {} MB and a copy is \
+                 made up to {} MB; the copies made hold {} MB of at most {} MB; {} buffers turned down so far ({} MB)",
+                size >> 10,
+                used >> 20,
+                budget >> 20,
+                (budget / 100 * share) >> 20,
+                CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
+                most >> 20,
+                n,
+                bytes >> 20,
+            );
+        }
         return None;
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
@@ -1973,6 +2023,22 @@ fn piece_at(start: usize, len: usize, piece: usize) -> (usize, usize) {
 #[cfg(test)]
 mod piece_tests {
     use super::{PIECE, piece_at, pieces_of};
+
+    #[test]
+    fn card_reserve_is_on_by_default_and_gives_up_refused_room() {
+        use super::{reserve_left, reserve_on_from};
+        assert!(reserve_on_from(None, None));
+        assert!(reserve_on_from(Some("1"), None));
+        assert!(!reserve_on_from(Some("0"), None));
+        assert!(!reserve_on_from(None, Some(" 0")));
+        assert!(!reserve_on_from(Some("1"), Some("0")));
+        const MIB: u64 = 1 << 20;
+        assert_eq!(reserve_left(1024 * MIB, 0, 0), 1024 * MIB);
+        assert_eq!(reserve_left(1024 * MIB, 945 * MIB, 0), 79 * MIB);
+        assert_eq!(reserve_left(1024 * MIB, 400 * MIB, 616 * MIB), 8 * MIB);
+        assert_eq!(reserve_left(1024 * MIB, 900 * MIB, 616 * MIB), 0);
+        assert_eq!(reserve_left(1024 * MIB, u64::MAX, 1), 0);
+    }
 
     /// The pieces cover a copy without gaps, each cut where the compare
     /// cuts (at multiples of 64 KiB of title memory).
