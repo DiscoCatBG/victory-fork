@@ -8779,14 +8779,22 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
+            // A texture already a copy source takes no barrier: one from a
+            // state to itself is not allowed (upstream #2545).
+            let source = state != D3D12_RESOURCE_STATE_COPY_SOURCE;
+            let to_dest = transition(
+                &back,
+                D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            );
+            if source {
+                list.ResourceBarrier(&[
+                    transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    to_dest,
+                ]);
+            } else {
+                list.ResourceBarrier(&[to_dest]);
+            }
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
@@ -8796,14 +8804,19 @@ impl Host {
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            let to_present = transition(
+                &back,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PRESENT,
+            );
+            if source {
+                list.ResourceBarrier(&[
+                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                    to_present,
+                ]);
+            } else {
+                list.ResourceBarrier(&[to_present]);
+            }
             copy.close();
             match slot {
                 Some(i) => {
