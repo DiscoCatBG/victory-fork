@@ -69,6 +69,9 @@ pub(crate) struct Shader {
     /// The host code translated for each link ([`Shader::linked_dxil`]).
     #[cfg(windows)]
     linked: Mutex<HashMap<victory_shader::emit::Link, Option<Arc<Vec<u8>>>>>,
+    /// A compute program's thread-group size as the console runs it
+    /// ([`group_size`]).
+    group: OnceLock<Option<[u32; 3]>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -123,6 +126,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 mesh_link: OnceLock::new(),
                 #[cfg(windows)]
                 linked: Mutex::new(HashMap::new()),
+                group: OnceLock::new(),
             })
         })
         .clone()
@@ -666,6 +670,28 @@ const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
 /// Stage names, in description order.
 const GRAPHICS_STAGES: [&str; 5] = ["vertex", "pixel", "domain", "hull", "geometry"];
+
+/// The thread-group size (`numthreads`) of the compute program the title's
+/// pipeline `this` runs, as the console runs it.
+pub(crate) fn group_size(this: This) -> Option<[u32; 3]> {
+    if this.is_null() {
+        return None;
+    }
+    let [shader] = pipeline(this).shaders.as_slice() else { return None };
+    if shader.stage != "compute" {
+        return None;
+    }
+    *shader.group.get_or_init(|| {
+        use victory_shader::native::StageIo;
+        use victory_shader::{Container, FourCC};
+        let c = Container::parse(&shader.container).ok()?;
+        let programs = victory_shader::native_programs(c.part(FourCC::DXIL)?.data).ok()?;
+        programs.iter().find_map(|p| match &p.io {
+            StageIo::Cs(cs) => Some(cs.threads),
+            _ => None,
+        })
+    })
+}
 
 fn pipeline<'a>(this: This) -> &'a Pipeline {
     // SAFETY: the title passes one of our pipelines.

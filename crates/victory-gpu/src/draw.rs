@@ -2532,6 +2532,11 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
+    /// The title's pipeline bound (null if none).
+    pub(crate) fn pipeline_this(&self) -> This {
+        self.pipeline as This
+    }
+
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped, or that later
         // indirect calls read (their clamps are hoisted no more).

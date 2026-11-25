@@ -1569,14 +1569,51 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
 
 /// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
 /// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    {
+        let [x, y, z] = dispatch_x_groups(this, [x, y, z], flags);
+        state::dispatch(this, x, y, z);
+    }
     #[cfg(not(windows))]
     {
         let _ = (this, x, y, z);
         count_dispatch();
     }
+}
+
+/// The console's dispatch initiator bit `USE_THREAD_DIMENSIONS`: the
+/// counts are of threads, not groups.
+const USE_THREAD_DIMENSIONS: u32 = 0x20;
+
+/// The groups a `DispatchX` runs. Its flags are the console's dispatch
+/// initiator bits; with [`USE_THREAD_DIMENSIONS`] (the ray-tracing structure
+/// builder's box rehydration, header copies and triangle reloads) the
+/// counts are threads, and taken for groups each ran 64 times its work,
+/// writing far past its structures (fxceless #994, f90061d: 2.2 GiB in a
+/// frame; here a builder run with a white room, 1.8 GB of copies a frame
+/// and the device removed 40 s in, at 7961866).
+/// shortcut: the last group of each dimension runs whole; the console
+/// launches only the threads inside the counts (f90061d translates a form
+/// whose extra threads leave).
+#[cfg(windows)]
+fn dispatch_x_groups(this: This, counts: [u32; 3], flags: u32) -> [u32; 3] {
+    if flags & USE_THREAD_DIMENSIONS == 0 {
+        return counts;
+    }
+    let mut pipeline = None;
+    with_state(this, |_, s| pipeline = Some(s.pipeline_this()));
+    let Some(group) = pipeline.and_then(crate::pipeline::group_size) else {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(?counts, "a dispatch by thread counts whose group size is not known runs them as groups"));
+        return counts;
+    };
+    let groups = std::array::from_fn(|i| counts[i].div_ceil(group[i].max(1)));
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+        tracing::info!(?counts, ?group, ?groups, "a dispatch by thread counts");
+    }
+    groups
 }
 
 /// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
