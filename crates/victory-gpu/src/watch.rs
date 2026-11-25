@@ -49,6 +49,13 @@ struct Journal {
     /// other ahead asking is made, and `ahead` stays, until
     /// [`ask_once_end`].
     kept: bool,
+    /// Page ranges that lie alone in a submission and that the kernel
+    /// refused when asked on their own ([`ask_once`]): memory that is not
+    /// write-watched, or a range across two reservations. They are not
+    /// asked again at every submission (30 a frame) but left to
+    /// [`writes`]; forgotten where the runtime maps or unmaps
+    /// ([`title_memory_remapped`]).
+    refused: std::collections::BTreeSet<(usize, usize)>,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
@@ -58,6 +65,7 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
+    refused: std::collections::BTreeSet::new(),
 });
 
 /// Ranges of one submission closer than this are asked about together:
@@ -88,7 +96,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         let g = guards();
         pieces.retain(|&(first, _)| {
             let block = first * PAGE / BLOCK;
-            !g.views.contains(block)
+            !(g.views.contains(block) || crate::inplace::shows_view(first * PAGE))
         });
     }
     if pieces.len() < 2 {
@@ -209,8 +217,13 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
+        if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) || j.refused.contains(&(first, last)) {
+            continue;
+        }
+        if ask_kernel(j, first, last, 1) {
             j.ahead.push((first, last));
+        } else {
+            j.refused.insert((first, last));
         }
     }
     j.kept = !j.ahead.is_empty();
@@ -256,7 +269,7 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
     }
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
-    if ask_kernel(j, first, last) {
+    if ask_kernel(j, first, last, 0) {
         j.ahead.push((first, last));
         return;
     }
@@ -265,10 +278,28 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
     ask_run(j, b);
 }
 
+/// Since the last frame line: the kernel askings that failed, by who
+/// asked: a run of a submission's ranges asked together ([`ask_run`], which
+/// then asks by halves), a range that lies alone in its submission
+/// ([`ask_once`]), [`writes`] for memory the guards may answer for, and
+/// [`writes`] for memory they may not. The run of main ec21622 had 195 to
+/// 467 a frame and one count for all of them.
+#[cfg(feature = "diagnostics")]
+static FAILED_AT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// [`FAILED_AT`], and zeroes it.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn failed_at() -> [u64; 4] {
+    std::array::from_fn(|i| FAILED_AT[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Asks the kernel for the written pages of pages `[first, last)` and notes
 /// them in the journal under the ahead asking; false (and nothing changed)
 /// if the range is not write-watched memory of one reservation.
-fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
+///
+/// `site` says who asks, for the count of failed askings ([`FAILED_AT`]):
+/// 0 a run of ranges asked together, 1 a range that lies alone.
+fn ask_kernel(j: &mut Journal, first: usize, last: usize, site: usize) -> bool {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
@@ -289,7 +320,12 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     } != 0;
     if failed {
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::WatchFailed, 1);
+        {
+            crate::copystat::add(crate::copystat::C::WatchFailed, 1);
+            FAILED_AT[site].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = site;
         return false;
     }
     #[cfg(feature = "diagnostics")]
@@ -366,6 +402,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     #[cfg(feature = "diagnostics")]
     if failed {
         crate::copystat::add(if known { crate::copystat::C::WatchKnownView } else { crate::copystat::C::WatchFailed }, 1);
+        if !known {
+            FAILED_AT[if guarded { 2 } else { 3 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     let guarded = if failed {
         count = 0;
@@ -422,9 +461,13 @@ fn known_view(start: usize) -> bool {
     if view_ask() {
         return false;
     }
-    let g = guards();
-    let first = start / BLOCK;
-    g.views.contains(first)
+    if guards().views.contains(start / BLOCK) {
+        return true;
+    }
+    // Or a view the runtime mapped and the guards have not taken yet: one
+    // mapped anew is no longer in the guards' sets ([`title_memory_remapped`]),
+    // and the title's streaming maps views all the time.
+    crate::inplace::shows_view(start)
 }
 
 /// Words of block bits per chunk of [`Blocks`]: a chunk holds 16,384
@@ -583,7 +626,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
         let g = guards();
         g.views.contains(start / BLOCK)
-    };
+    } || (!view_ask() && crate::inplace::shows_view(start));
     if !known && !is_view(start, end) {
         return None;
     }
@@ -1088,6 +1131,15 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
+    {
+        // What the kernel refused to answer for there may be other memory
+        // now.
+        let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        if !j.refused.is_empty() {
+            j.refused.retain(|&(a, b)| b <= first || a >= last);
+        }
+    }
     let mut g = guards();
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     // The blocks keep the access the runtime's mapping gave them: what it

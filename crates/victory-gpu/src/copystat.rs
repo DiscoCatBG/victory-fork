@@ -1273,9 +1273,16 @@ pub(crate) fn log(frames: f64) {
             longest as f64 / 1e3
         );
     }
+    let failed_at = crate::watch::failed_at().map(|n| n as f64 / frames);
     tracing::info!(
-        "  write-watch askings per frame: {:.0} failed in the kernel, {:.0} not made for memory the guards hold as views",
+        "  write-watch askings per frame: {:.0} failed in the kernel ({:.0} of runs of ranges asked together, {:.0} of \
+         ranges lying alone, {:.0} of single askings where the guards then answer, {:.0} where nothing does), {:.0} \
+         not made for memory the guards hold as views",
         c[C::WatchFailed as usize],
+        failed_at[0],
+        failed_at[1],
+        failed_at[2],
+        failed_at[3],
         c[C::WatchKnownView as usize]
     );
     tracing::info!(

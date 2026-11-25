@@ -433,6 +433,14 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     crate::watch::views_mapped(section, offset, len);
 }
 
+/// Whether `at` lies in a view the runtime told us it mapped
+/// ([`title_memory_view`]) and has not remapped since: view memory, which
+/// the kernel's write watch cannot answer for (`crate::watch`).
+pub(crate) fn shows_view(at: usize) -> bool {
+    let v = views();
+    v.views.range(..=at).next_back().is_some_and(|(base, view)| at - base < view.0)
+}
+
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):
 /// the views that touch it are forgotten (the runtime tells again those it
 /// maps anew).
