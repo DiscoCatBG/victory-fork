@@ -19,7 +19,8 @@ pub(crate) struct HostHeap {
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
-    /// Dynamic slots past `count`: [`DYNAMIC`] in view heaps, none in
+    /// Dynamic slots past `count`: [`DYNAMIC`] in view heaps (more on an
+    /// uncapped host heap: `dynamic_uncapped`), none in
     /// sampler heaps. (Upstream falls back to 2^16 on a capped host heap;
     /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
     dynamic: u32,
@@ -665,6 +666,26 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// Dynamic slots in a view heap of [`UNCAPPED_VIEWS`] (AMD), when the
+/// title's slots leave room for them before the null slot
+/// (`VICTORY_DYNAMIC_SLOTS`, 2^19; `=262144` is the value before). 2^18
+/// ran out in the prison's waiting room on an RX 7900 XT (main 7447a7a):
+/// tables asked went from about 13,000 a frame in the corridor to 25,600,
+/// and from the first refusal on (n=178) 276 to 565 tables a frame were
+/// refused and their draws dropped, with the picture blown out to white
+/// in five of the seven captures after it and none of those before. A
+/// heap of 2^21 holds the title's 1,507,328 and 2^19 with 65,000 to spare.
+fn dynamic_uncapped() -> u32 {
+    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_DYNAMIC_SLOTS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1 << 19)
+            .max(DYNAMIC)
+    })
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -696,6 +717,13 @@ impl HostHeap {
             0
         } else {
             victory_shader::emit::view_heap_limit()
+        };
+        // More dynamic slots where the title's leave room for them before
+        // the null slot (an uncapped host heap); as many as before where not.
+        let extra = if !sampler && null >= UNCAPPED_VIEWS - 1 && count.saturating_add(dynamic_uncapped()) <= null {
+            dynamic_uncapped()
+        } else {
+            extra
         };
         let (heap, count, size) = if null == 0 {
             match make(count + extra) {
@@ -761,8 +789,8 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
-            free: std::sync::atomic::AtomicU32::new(DYNAMIC),
+            next: Mutex::new((0, vec![false; extra as usize])),
+            free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Mutex::default(),
@@ -867,7 +895,7 @@ impl HostHeap {
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
+        for at in starts.take(if enough { self.dynamic as usize } else { 0 }) {
             // A run cannot wrap past the end.
             if at != last.wrapping_add(1) {
                 run = 0;
@@ -897,7 +925,7 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
+        *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
 
