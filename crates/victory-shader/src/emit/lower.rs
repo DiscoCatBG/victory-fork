@@ -2712,18 +2712,19 @@ impl<'a> Lower<'a> {
     }
 
     /// Whether the program is a compute program that reads its group's
-    /// number in x alone, with room for a dword of the host's among its user
-    /// data (the host's root signature holds 64 dwords, views included).
+    /// number in x, with room for a dword of the host's among its user data
+    /// (the host's root signature holds 64 dwords, views included). The
+    /// host splits a dispatch along x alone, so reads of y and z stay
+    /// right; a program with a spilled user-data table counts its dwords
+    /// from 16 ([`Self::user_first`]). The structure builder's stages are
+    /// such programs and ask for up to 82,606 groups in x (run at 25091d8).
     fn one_dimensional(&self) -> bool {
-        const MOST: u32 = 20;
+        const MOST: u32 = 40;
         let reads = |c| self.x.io.inputs.iter().any(|i| i.1 == Input::GroupId(c));
         let words = self.x.native.layout.iter().map(|e| u32::from(e.user_data) + e.sgprs).max().unwrap_or(0);
         matches!(self.x.native.io, StageIo::Cs(_))
             && reads(0)
-            && !reads(1)
-            && !reads(2)
-            && words <= MOST
-            && !crate::spill::is_spilled(self.x.native)
+            && words.saturating_sub(self.user_first()) <= MOST
     }
 
     /// A component of a compute thread or group id, read in the entry block.
