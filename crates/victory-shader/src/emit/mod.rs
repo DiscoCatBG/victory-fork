@@ -120,8 +120,8 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_ADDRESSES, HEAP_MARKS_DWORDS, SLOT_FAULTS, SLOT_HEAP_MARKS, SLOT_MEMORY,
-    SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_STRIDES_DWORDS, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
+    MEMORY_FAULTS, MEMORY_MARKS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_ADDRESSES, HEAP_MARKS_DWORDS, SLOT_FAULTS, SLOT_HEAP_MARKS, SLOT_MEMORY,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_STRIDES_DWORDS, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
     USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
 };
 
@@ -286,6 +286,21 @@ pub struct HostShader {
     pub root_uavs: Vec<u8>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
+    /// Table descriptors (root parameter, dword offset in the table) whose
+    /// buffer the shader reads or writes sixteen bits a channel
+    /// (`buffer_load_format_d16_*`, `buffer_store_format_d16_*`), in
+    /// order. On the console each channel's 16 bits move as they are
+    /// through a 16-bit float view and through a 16-bit integer one alike
+    /// (the title keeps half floats, and indices beside them, in
+    /// `R16G16B16A16_UINT` and `R16_UINT` buffers). The DXIL moves them as
+    /// unsigned integers, which an unsigned 16-bit view carries unchanged;
+    /// the host shows the shader a 16-bit float or signed buffer view at
+    /// these places as the unsigned format of the same layout.
+    /// shortcut: a view in a normalised 16-bit format, whose values the
+    /// console would convert to halves, is read as its integers; a
+    /// descriptor picked at run time keeps the float path (its slot, and so
+    /// its format, is known only then).
+    pub half_views: Vec<(u8, u32)>,
 }
 
 impl HostShader {
@@ -751,6 +766,11 @@ fn emit_program(
     let pixel = native.stage == HwStage::Ps;
     let mut inputs = sig(FourCC::ISG1)?;
     let mut outputs = sig(FourCC::OSG1)?;
+    // DXIL reads SV_Coverage via `dx.op.coverage` (NotInSig); keep it out of
+    // pixel ISG1 if a console container listed it there.
+    if pixel {
+        inputs.retain(|e| e.kind != 14);
+    }
     // Interpolation as the console container's PSV0 declares it, falling back
     // to DXC's defaults when no PSV0 is present; pixel inputs that are read
     // also get the mode their barycentrics say.
@@ -873,6 +893,7 @@ fn emit_program(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        half_views: l.half_views,
     };
     Ok((shader, wave_size))
 }
@@ -1422,6 +1443,7 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1434,6 +1456,7 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -1907,6 +1930,7 @@ mod tests {
                 root_srvs: l.root_srvs.clone(),
                 root_uavs: l.root_uavs.clone(),
                 root_indexed_views: Vec::new(),
+                half_views: l.half_views.clone(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
@@ -2104,6 +2128,7 @@ mod tests {
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
+                half_views: l.half_views,
             };
             // 32 dwords = 128 bytes = 8 elements of stride 16.
             let data: Vec<u32> = (0..32).map(|i| 1000 + i).collect();
@@ -2262,6 +2287,11 @@ mod barycentric_tests {
     /// Translates a pixel program with the input VGPRs `input_addr`
     /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
+        pixel_with(words, input_addr, false)
+    }
+
+    /// `pixel`, with TEXCOORD0 held as 16-bit values when `fp16`.
+    fn pixel_with(words: &[u32], input_addr: u32, fp16: bool) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -2275,7 +2305,7 @@ mod barycentric_tests {
                     mask: 0b1111,
                     attr: 0,
                     flat: false,
-                    fp16: false,
+                    fp16,
                     pack2: false,
                     row2: 0,
                 }],
@@ -2375,6 +2405,26 @@ mod barycentric_tests {
         let (features, inputs) = parts(&shader);
         assert_eq!(features & 0x2_0000, 0);
         assert!(inputs.iter().all(|e| e.kind != 28), "{inputs:?}");
+        validate(&shader);
+    }
+
+    /// An f16 interpolation's first half keeps no value of its own (the second half writes
+    /// another VGPR and recomputes it). A `v_fma_mixlo_f16` into that VGPR keeps its high
+    /// half: zero then, as for other 16-bit writes, and the program translates.
+    /// Eight of the title's deferred material pixel programs do this.
+    #[test]
+    fn mixlo_over_an_f16_first_interpolation_half() {
+        let [e0, e1] = exp_mrt0(4);
+        let words = [
+            0xD742_0003, 0x0002_0000, // v_interp_p1ll_f16 v3, v0, attr0.x
+            0xD75A_0002, 0x040E_0200, // v_interp_p2_f16 v2, v1, attr0.x, v3
+            0xCC21_0003, 0x0A02_0502, // v_fma_mixlo_f16 v3, v2, v2, 0
+            0x7E08_1703,              // v_cvt_f32_f16 v4, v3
+            e0,
+            e1,
+            0xBF81_0000,
+        ];
+        let shader = pixel_with(&words, PERSP_CENTER, true).unwrap();
         validate(&shader);
     }
 
@@ -2627,6 +2677,177 @@ mod barycentric_tests {
         assert_eq!(isg1[8 + 25], 0x1, "dead .y channel left in ISG1 rw mask");
         validate(&shader);
     }
+
+    /// `v_interp_p2_f16` writing `v3` (`dst_high`: `op_sel[3]`, `omod`,
+    /// `clamp`), after initialising `v3` to `0x3800_3400` so the untouched
+    /// half stays visible on readback.
+    fn interp_p2_f16_shader(dst_high: bool, omod: u32, clamp: bool) -> HostShader {
+        let [e0, e1] = exp_mrt0(3);
+        let w0 = (0x35u32 << 26)
+            | (0x35au32 << 16)
+            | (u32::from(clamp) << 15)
+            | (u32::from(dst_high) << 14)
+            | 3;
+        let w1 = ((256 + 1) << 9) | ((256 + 2) << 18) | (omod << 27);
+        let words = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0x7E06_02FF,
+            0x3800_3400, // v_mov_b32 v3, 0x3800_3400
+            w0,
+            w1, // v_interp_p2_f16 v3, attr0.x, v1, v2
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![PsInput {
+                    usage: Usage::Generic,
+                    row: 0,
+                    mask: 0b1111,
+                    attr: 0,
+                    flat: false,
+                    fp16: true,
+                    pack2: false,
+                    row2: 0,
+                }],
+                input_addr: PERSP_CENTER,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let mut texcoord = element("TEXCOORD", 0, 0);
+        texcoord.half = true;
+        let mut target = element("SV_Target", 16, 0);
+        target.usage = 15;
+        let isg1 = container::signature(&[texcoord], true);
+        let osg1 = container::signature(&[target], false);
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        emit(&c, &native, &p, &st, &io, &res).unwrap()
+    }
+
+    #[test]
+    fn v_interp_p2_f16_translates_and_validates() {
+        for (dst_high, omod, clamp) in [(false, 0, false), (true, 1, true), (true, 3, false)] {
+            let shader = interp_p2_f16_shader(dst_high, omod, clamp);
+            validate(&shader);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn v_interp_p2_f16_honors_op_sel_omod_and_clamp_on_gpu() {
+        use super::bitcode::{Attr, Term};
+        use super::host::{Draw, Host};
+        use super::shader::Shader;
+
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut vs = Shader::new(false);
+        let pos_in = element("POSITION", 0, 0);
+        let tex_in = element("TEXCOORD", 0, 1);
+        vs.inputs = vec![
+            SigElement {
+                usage: 15,
+                ..pos_in
+            },
+            SigElement {
+                usage: 15,
+                ..tex_in
+            },
+        ];
+        let mut tex_out = element("TEXCOORD", 0, 0);
+        tex_out.interp = 2;
+        tex_out.usage = 15;
+        let mut pos_out = element("SV_Position", 3, 1);
+        pos_out.interp = 4;
+        pos_out.usage = 15;
+        vs.outputs = vec![tex_out, pos_out];
+        let b = vs.entry;
+        for (from, to) in [(1u32, 0u32), (0, 1)] {
+            for col in 0..4 {
+                let args = [vs.m.i32(from), vs.m.i32(0), vs.m.i8(col), vs.m.undef(vs.t.i32)];
+                let v = vs.op(b, "loadInput.f32", Attr::ReadNone, vs.t.f32, 4, &args);
+                let args = [vs.m.i32(to), vs.m.i32(0), vs.m.i8(col), v];
+                vs.op(b, "storeOutput.f32", Attr::NoUnwind, vs.t.void, 5, &args);
+            }
+        }
+        vs.m.terminate(b, Term::Ret);
+        let vs = HostShader {
+            stage: HwStage::Vs,
+            dxil: vs.finish(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
+        };
+        validate(&vs);
+
+        #[rustfmt::skip]
+        let vertices: &[f32] = &[
+            -1.0, -1.0, 0.5, 1.0, 0.75, 0.0, 0.0, 0.0,
+             3.0, -1.0, 0.5, 1.0, 0.75, 0.0, 0.0, 0.0,
+            -1.0,  3.0, 0.5, 1.0, 0.75, 0.0, 0.0, 0.0,
+        ];
+        // TEXCOORD0.x = 0.75 (0x3A00 in f16). Initial v3 = 0x3800_3400.
+        let cases = [
+            (false, 0, false, 0x3800_3A00u32), // low half <- 0.75, high half kept
+            (true, 1, true, 0x3C00_3400u32),   // high half <- clamp(0.75 * 2.0) = 1.0, low kept
+            (true, 3, false, 0x3600_3400u32),  // high half <- 0.75 * 0.5 = 0.375, low kept
+        ];
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            for &(dst_high, omod, clamp, expected) in &cases {
+                let ps = interp_p2_f16_shader(dst_high, omod, clamp);
+                let (root, pso) = host.pipeline(&vs, &ps).unwrap();
+                let texels = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: Vec::new(),
+                            textures: &[],
+                            samplers: &[],
+                            vertices,
+                            stride: 32,
+                            size: (4, 4),
+                            mesh_groups: 0,
+                        },
+                    )
+                    .unwrap();
+                assert!(
+                    texels.iter().all(|t| t[0].to_bits() == expected),
+                    "{label} (high={dst_high}, omod={omod}, clamp={clamp}): got {:#010x}, expected {expected:#010x}",
+                    texels[0][0].to_bits()
+                );
+            }
+            eprintln!("{label}: v_interp_p2_f16 op_sel/omod/clamp verified");
+            ran += 1;
+        }
+        if ran == 0 {
+            eprintln!("no SM 6.6 device; skipped");
+        }
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -2701,6 +2922,7 @@ fn raw_buffer_get_dimensions_compiles_on_host() {
         root_srvs: vec![],
         root_uavs: vec![],
         root_indexed_views: vec![],
+        half_views: Vec::new(),
     };
     host.compute_pipeline(&shader)
         .expect("raw buffer getDimensions compute pipeline should compile");

@@ -134,6 +134,12 @@ struct Window {
     base: u64,
     records: u32,
     scratch: ID3D12Resource,
+    /// Where record 0 is in `scratch`: 0, or the offset of the room it was
+    /// given in the list of hoisted clamps (`crate::indirect::hoisting`).
+    scratch_at: u64,
+    /// Whether `scratch` is hoisted room (its state is the list of hoisted
+    /// clamps' business: nothing to change after a call).
+    hoisted: bool,
 }
 
 /// The most records clamped in one pass ([`windows`]).
@@ -182,12 +188,17 @@ const WINDOW_MOST: u64 = 64;
 /// charged what it asks, a few thousand of 2^27. And arguments the title's CPU side changes are seen as
 /// before, at the next submission.
 ///
+/// On by default since the indirect clamp charges its budget once per
+/// group (upstream #220): in the world on an RTX 4090, 159 ms a frame
+/// without windows, 117-126 ms with them. `VICTORY_INDIRECT_WINDOW=0`
+/// clamps record by record, as before.
+///
 /// Off for the rest of the run from the first error the card's driver
 /// reports to the system (`crate::drvwatch`): every loss of the card in a
 /// run with windows was announced that way seconds ahead.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1")) && !crate::drvwatch::tripped()
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0")) && !crate::drvwatch::tripped()
 }
 
 /// Whether a record that is not on the window's walk opens a window of its
@@ -384,6 +395,11 @@ pub(crate) struct State {
     /// command before this one on the list.
     #[cfg(feature = "diagnostics")]
     last_indirect: (u64, u64),
+    /// The host list (its address) whose indirect draws have their clamps
+    /// hoisted into a list before it (`crate::indirect::hoisting`), and its
+    /// [`HostList::hoist_mark`] when that began: the hoist holds while both
+    /// are the same and nothing of this state ended it ([`State::end_hoist`]).
+    hoist: Option<(usize, u64)>,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -767,6 +783,41 @@ macro_rules! once {
     }};
 }
 
+/// The most thread groups the host runs in one dimension of a dispatch.
+const PART: u32 = 65_535;
+/// Parts a direct dispatch may be split into (`group_base`).
+const SPLIT_MOST: u32 = 16;
+/// Direct dispatches run in parts so far.
+pub(crate) static SPLIT_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Where a compute pipeline's program takes the number of its first thread
+/// group (`victory_shader::emit::USER_GROUP_BASE`): the root parameter of
+/// its user data and the dword in it. Ported from e9a5fb6 (myokex/victory-amd
+/// 4436f8f, 892d259): the console runs any number of groups in x.
+fn group_base(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
+    let stage = p.stages.first().filter(|_| p.compute)?;
+    let (param, _) = stage.user_data?;
+    let base = RootType::Other(victory_shader::emit::USER_GROUP_BASE);
+    let word = stage.translated().host.user_data.iter().find(|u| u.root == base)?;
+    Some((param, word.index))
+}
+
+/// Bounds a direct dispatch to the limits also enforced for indirect ones.
+fn direct_dispatch_allowed(x: u32, y: u32, z: u32) -> bool {
+    const MAX_GROUPS_PER_DIMENSION: u32 = 65_535;
+    const MAX_GROUPS_PER_DISPATCH: u64 = 1 << 20;
+    if x > MAX_GROUPS_PER_DIMENSION
+        || y > MAX_GROUPS_PER_DIMENSION
+        || z > MAX_GROUPS_PER_DIMENSION
+    {
+        return false;
+    }
+    u64::from(x)
+        .checked_mul(u64::from(y))
+        .and_then(|xy| xy.checked_mul(u64::from(z)))
+        .is_some_and(|groups| groups <= MAX_GROUPS_PER_DISPATCH)
+}
+
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     let slot = slot as usize;
     if roots.len() <= slot {
@@ -1064,7 +1115,11 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        // Set between the parts of a large dispatch (`group_base`).
+        if kind == USER_GROUP_BASE {
+            return 0;
+        }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
@@ -1300,7 +1355,13 @@ impl State {
             STORES.set(t.stores);
             #[cfg(feature = "diagnostics")]
             let phase = BindPhase::start(BIND_TABLES);
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            let made = self.tables(
+                list,
+                &t.used,
+                &t.host.root_indexed_views,
+                &t.host.half_views,
+                compute,
+            );
             #[cfg(feature = "diagnostics")]
             drop(phase);
             STORES.set(true);
@@ -1310,8 +1371,11 @@ impl State {
             }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
-            let writes = (t.stores || !write_skip())
-                && !crate::pipeline::builder_quarantined(self.pipeline as This);
+            let quarantined = crate::pipeline::builder_quarantined(self.pipeline as This);
+            if quarantined {
+                list.quarantine();
+            }
+            let writes = (t.stores || !write_skip()) && !quarantined;
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
                 // The structure builder off: what its structures' walkers
@@ -1339,7 +1403,16 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                // On the stack for the common sizes: this runs for every
+                // draw on the recording threads (fxceless #867, powplusplus).
+                let mut stack_values = [0u32; 64];
+                let mut heap_values = Vec::new();
+                let values: &mut [u32] = if (dwords as usize) <= stack_values.len() {
+                    &mut stack_values[..dwords as usize]
+                } else {
+                    heap_values.resize(dwords as usize, 0);
+                    &mut heap_values
+                };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
@@ -2254,16 +2327,19 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
+        // 20 ms by default (it was 250, with a backlog 750: the pass took
+        // 750-850 ms of a world frame, 43-68 ms at 20; fxceless #867 via
+        // PalmVIDev #221); `VICTORY_TEXTURE_STAGE_MS=250` as before.
         static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
+            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(20)
         }));
         // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
-        // surfaces at 192 MB a frame) gets three times the bytes and the time until it
-        // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
+        // surfaces at 192 MB a frame) gets twice the bytes and the time until it
+        // drains (three times before fxceless #867); `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 2, span * 2) } else { (per_frame, span) };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
@@ -2657,10 +2733,17 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
+    /// The title's pipeline bound (null if none).
+    pub(crate) fn pipeline_this(&self) -> This {
+        self.pipeline as This
+    }
+
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
-        // It may write the arguments a window holds clamped.
+        // It may write the arguments a window holds clamped, or that later
+        // indirect calls read (their clamps are hoisted no more).
         self.window = None;
         list.gather_close();
+        self.hoist = None;
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2674,7 +2757,7 @@ impl State {
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
-        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs(Some(self.pipeline as This)) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
@@ -2700,6 +2783,28 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        // More groups in x than the host runs in one dispatch: in parts, if
+        // the program takes the number of its first group (`group_base`).
+        let split = group_base(p).filter(|_| x > PART);
+        let x_checked = if split.is_some() { x.min(PART) } else { x };
+        if !direct_dispatch_allowed(x_checked, y, z) || (split.is_some() && x > PART * SPLIT_MOST) {
+            once!(
+                groups = format_args!("{x}x{y}x{z}"),
+                "a direct compute dispatch exceeds host work limits and is dropped"
+            );
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::pipeline::note_why(format!(
+                    "direct dispatch {x}x{y}x{z} exceeds host work limits"
+                ));
+                self.list_dropped_roots([x, y, z]);
+            }
+            if crate::pipeline::is_builder(self.pipeline as This) {
+                crate::pipeline::builder_off("a direct dispatch exceeded host work limits");
+            }
+            return;
+        }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -2711,8 +2816,24 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        match split {
+            Some((param, dword)) => {
+                // SAFETY: an open list with everything set; the parameter
+                // and dword are the pipeline's.
+                unsafe {
+                    let mut base = 0;
+                    while base < x {
+                        list.list.SetComputeRoot32BitConstant(param, base, dword);
+                        list.list.Dispatch((x - base).min(PART), y, z);
+                        base += PART;
+                    }
+                    list.list.SetComputeRoot32BitConstant(param, 0, dword);
+                }
+                SPLIT_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+            }
+            // SAFETY: an open list with everything set.
+            None => unsafe { list.list.Dispatch(x, y, z) },
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -2974,6 +3095,7 @@ impl State {
         if self.may_store() {
             list.gather_close();
         }
+        self.hoist = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -3138,11 +3260,19 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    ///
+    /// `half`: the table descriptors the shader moves sixteen bits a
+    /// channel as unsigned integers (`HostShader::half_views`). A table
+    /// with a 16-bit float or signed buffer view at one of them is made
+    /// afresh as well, with that view in the unsigned format of the same
+    /// layout (`descriptor::host::half_view`): the title's own slot keeps
+    /// the title's format for the shaders that read it as floats.
     pub(crate) fn tables(
         &mut self,
         list: &HostList,
         used: &[UsedResource],
         indexed: &[RootIndexedView],
+        half: &[(u8, u32)],
         compute: bool,
     ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
@@ -3152,6 +3282,36 @@ impl State {
             .filter(|u| u.kind == ResourceType::Cbv)
             .map(|u| u.slot)
             .collect();
+        // The view shown in place of the title's at dword `at` of the table
+        // in root parameter `slot`, if the shader moves halves there and
+        // the title's view is a 16-bit float or signed buffer view.
+        let halved = |state: &Self, slot: u8, at: u32| -> Option<View> {
+            if !half.contains(&(slot, at)) {
+                return None;
+            }
+            let Some(&Root::Table(table)) = state.roots_ref(compute).get(usize::from(slot)) else {
+                return None;
+            };
+            crate::descriptor::host::half_view(&crate::descriptor::view(table + u64::from(at) * 4)?)
+        };
+        for &(slot, at) in half {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                continue;
+            };
+            let Some(view) = crate::descriptor::view(table + u64::from(at) * 4) else {
+                continue;
+            };
+            if crate::descriptor::host::half_view(&view).is_some() {
+                if !fresh.contains(&slot) {
+                    fresh.push(slot);
+                }
+            } else if let Some(format) = crate::descriptor::host::half_inexact(&view) {
+                once!(
+                    format,
+                    "a shader moves a buffer's 16-bit channels as integers through a view whose values the console converts: they are read and written unconverted"
+                );
+            }
+        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
@@ -3215,6 +3375,15 @@ impl State {
                     index.byte_offset.wrapping_add(constant << index.shift) / 32
                 })
                 .collect();
+            // The descriptors the shader moves halves through are made too,
+            // and the table reaches them: they may lie past the range starts
+            // the entries give (a range of several views names only its
+            // first; review on #927).
+            selected.extend(
+                half.iter()
+                    .filter(|&&(s, _)| s == slot)
+                    .map(|&(_, at)| at / 8),
+            );
             selected.sort_unstable();
             selected.dedup();
             let n = entries
@@ -3239,6 +3408,9 @@ impl State {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                    // (Another table than the same slots made for a shader
+                    // that reads them in the title's formats.)
+                    half.contains(&(slot, k * 8)).hash(&mut h);
                 }
                 (table, n, h.finish())
             };
@@ -3309,7 +3481,10 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        match halved(self, slot, k * 8) {
+                            Some(shown) => host.make_at(index, &shown),
+                            None => host.make_at(index, &view),
+                        }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
@@ -3421,6 +3596,7 @@ impl State {
         if self.may_store() {
             list.gather_close();
         }
+        self.end_hoist_if_stores();
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -3529,6 +3705,7 @@ impl State {
         if self.may_store() {
             list.gather_close();
         }
+        self.end_hoist_if_stores();
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3557,26 +3734,70 @@ impl State {
 }
 
 impl State {
+    /// Whether the clamps of `list`'s indirect draws still go to the list
+    /// of hoisted clamps before it: nothing recorded since the hoist began
+    /// may have written their arguments (`crate::indirect::hoisting`).
+    pub(crate) fn hoisting_into(&self, list: &HostList) -> bool {
+        self.hoist == Some((std::ptr::from_ref(list) as usize, list.hoist_mark()))
+    }
+
+    /// From here on the clamps of `list`'s indirect draws go to the list of
+    /// hoisted clamps before it (`crate::list` made that list).
+    pub(crate) fn hoist_into(&mut self, list: &HostList) {
+        list.bump_hoist_mark();
+        self.hoist = Some((std::ptr::from_ref(list) as usize, list.hoist_mark()));
+    }
+
+    /// Recorded work that may write indirect arguments: clamps of later
+    /// calls are no longer hoisted before it (the next indirect draw starts
+    /// a hoist of its own).
+    pub(crate) fn end_hoist(&mut self) {
+        self.hoist = None;
+    }
+
+    /// A draw whose shaders store to buffers may write the arguments of
+    /// later indirect calls: their clamps are hoisted no more.
+    fn end_hoist_if_stores(&mut self) {
+        if self.hoist.is_some()
+            && crate::pipeline::host_pipeline(self.pipeline as This)
+                .is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))
+        {
+            self.hoist = None;
+        }
+    }
+
     /// Indirect execution of a one-argument signature of `kind` (PC
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
     /// records `stride` bytes apart at title address `arguments`, and the
     /// record count at `count` if the title gives one: the GPU reads them
     /// from the buffer's host copy, where earlier dispatches may have
     /// written them. False if it cannot run on the host.
-    pub(crate) fn execute_indirect(
+    /// `clamps`: the open list of hoisted
+    /// clamps that runs before `list` (`crate::indirect::hoisting`), if
+    /// there is one. Draws (not dispatches, not rectangles) have their
+    /// clamp recorded there while the hoist holds ([`State::hoisting_into`]),
+    /// so that nothing of ours comes between a run of indirect draws;
+    /// anything else, or a clamp that cannot be hoisted, is clamped before
+    /// its call as always.
+    pub(crate) fn execute_indirect_with(
         &mut self,
         list: &HostList,
+        clamps: Option<&crate::host::HostList>,
         (kind, stride, max): (u32, u32, u32),
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        // A dispatch may write the arguments of later indirect calls.
+        if kind == 2 {
+            self.hoist = None;
+        }
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
-        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs(Some(self.pipeline as This)) {
             return false;
         }
         // A program that walks ray-tracing structures nothing has built:
@@ -3705,7 +3926,8 @@ impl State {
             .as_ref()
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
-            .map(|w| (w.scratch.clone(), offset - w.base, w.step));
+            .map(|w| (w.scratch.clone(), w.scratch_at + (offset - w.base), w.step, w.hoisted));
+        let stores = p.stages.iter().any(|stage| stage.translated().stores);
         // A record that misses its window: a slot the list's prelude fills,
         // if the list still gathers ([`gathers`]).
         let gathered = if hit.is_none() && windowed && gathers() {
@@ -3716,8 +3938,8 @@ impl State {
         } else {
             None
         };
-        let (bounded, at) = match (hit, gathered) {
-            (Some((scratch, at, step)), _) => {
+        let (bounded, at, hoisted) = match (hit, gathered) {
+            (Some((scratch, at, step, hoisted)), _) => {
                 // Diagnostics of windows: the record clamped again and
                 // compared (`crate::indirect::window_check`).
                 if crate::indirect::window_check()
@@ -3740,7 +3962,7 @@ impl State {
                         self.walk_step = Some((w.copy, w.kind, w.stride, w.step));
                     }
                 }
-                (scratch, at)
+                (scratch, at, hoisted)
             }
             (None, Some((scratch, at))) => {
                 // The record's bytes are up to date when the list is
@@ -3752,7 +3974,7 @@ impl State {
                     self.host_pipeline = 0;
                     self.host_roots[1] = 0;
                 }
-                (scratch, at)
+                (scratch, at, false)
             }
             (None, None) => {
                 // A window opened at the remembered step that no draw read
@@ -3800,6 +4022,52 @@ impl State {
                     None => (step, records),
                 };
                 self.window_read = false;
+                // Hoisted: clamped in the list before this one, into room of
+                // that list's own; the arguments are brought up to date for
+                // it, the count for both (the call reads it too). If that
+                // cannot be done, clamped here as always.
+                let ahead = windowed && records > 1;
+                let hoisted = match clamps {
+                    Some(clamps)
+                        if kind != DISPATCH
+                            && self.topology != RECTANGLES
+                            && self.hoisting_into(list) =>
+                    {
+                        args.refresh(clamps, arguments, len.max(u64::from(step) * u64::from(records)));
+                        if let Some((s, at)) = &counter {
+                            s.refresh(clamps, *at, 4);
+                        }
+                        let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                        crate::indirect::bound_hoisted(
+                            clamps,
+                            (&args.buffer, offset),
+                            if ahead { None } else { count_arg },
+                            (kind, step, records),
+                            ahead,
+                        )
+                    }
+                    _ => None,
+                };
+                if let Some((bounded, at)) = hoisted {
+                    if let Some((s, at)) = &counter {
+                        s.refresh(list, *at, 4);
+                    }
+                    // Nothing of ours was recorded in this list: what it has
+                    // bound stays. It holds the buffer until it has run.
+                    list.keep(&bounded);
+                    self.window = windowed.then(|| Window {
+                        copy: args.id(),
+                        kind,
+                        stride,
+                        step,
+                        base: offset,
+                        records,
+                        scratch: bounded.clone(),
+                        scratch_at: at,
+                        hoisted: true,
+                    });
+                    (bounded, at, true)
+                } else {
                 args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
                 list.buffer_read(&args.buffer);
                 if let Some((s, at)) = &counter {
@@ -3812,7 +4080,7 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
-                let bounded = if windowed && records > 1 {
+                let bounded = if ahead {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
@@ -3857,8 +4125,11 @@ impl State {
                     base: offset,
                     records,
                     scratch: bounded.clone(),
+                    scratch_at: 0,
+                    hoisted: false,
                 });
-                (bounded, 0)
+                (bounded, 0, false)
+                }
             }
         };
         #[cfg(feature = "diagnostics")]
@@ -3903,6 +4174,10 @@ impl State {
         // The scratch buffer stays readable as arguments: the next draw of
         // the window reads it with no barrier, and the next clamp moves it
         // back (`crate::indirect`).
+        // Its shaders may write the arguments of the calls after it.
+        if stores {
+            self.hoist = None;
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

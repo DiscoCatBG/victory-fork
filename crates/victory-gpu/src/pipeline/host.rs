@@ -519,7 +519,18 @@ impl HostPipeline {
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host root signature refused");
+                // Its size in dwords (64 at most): constants one each, root
+                // views two, tables one.
+                let dwords: u32 = params
+                    .iter()
+                    .map(|p| match p.ParameterType {
+                        // SAFETY: the union member the type names.
+                        D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS => unsafe { p.Anonymous.Constants.Num32BitValues },
+                        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE => 1,
+                        _ => 2,
+                    })
+                    .sum();
+                tracing::warn!(error = %e, dwords, ?shaders, "host root signature refused");
                 return None;
             }
         };
@@ -764,6 +775,9 @@ impl HostPipeline {
                 return None;
             }
         };
+        #[cfg(feature = "diagnostics")]
+        tracing::info!(?shaders, state = %g.describe(), "host pipeline");
+        #[cfg(not(feature = "diagnostics"))]
         tracing::info!(?shaders, "host pipeline");
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(

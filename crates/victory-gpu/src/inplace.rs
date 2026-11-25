@@ -169,6 +169,23 @@ pub(crate) struct Placed {
     pub(crate) gpu: u64,
     /// Bytes from the buffer's first byte to the title memory's first.
     pub(crate) bias: u64,
+    /// For view memory ([`place_stretch`]): the view of ours the heap was
+    /// opened on. Declared after the heap so it is unmapped after it.
+    pub(crate) own: Option<OwnView>,
+}
+
+/// A view of ours on a stretch of a title section, unmapped when dropped:
+/// after the heap opened on it ([`Placed::own`], and the tuple
+/// `crate::shadow` retires).
+pub(crate) struct OwnView(usize);
+
+impl Drop for OwnView {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        // SAFETY: a view we mapped in `place_stretch`, used by nothing now:
+        // the heap on it and its buffer went first.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.0 as *mut _ }) };
+    }
 }
 
 /// Opens the 64 KiB pages that hold title memory `[start, start + len)`
@@ -189,7 +206,73 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed { buffer, heap, gpu, bias: start - at })
+    Ok(Placed { buffer, heap, gpu, bias: start - at, own: None })
+}
+
+/// Whether view memory one run of one section long may be used in place
+/// through a view of ours ([`place_stretch`]); `VICTORY_STRETCH=0` turns it
+/// off.
+fn stretch_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STRETCH").is_none_or(|v| v != "0"))
+}
+
+/// Stretches shorter than this are copied: each one in place is a host heap.
+const STRETCH_LEAST: u64 = 1 << 20;
+
+/// Title memory the title shows page by page, in place. A title may map its
+/// streaming heaps one 64 KiB view at a time, each its own allocation,
+/// which the host cannot open as one heap, though the pages follow one
+/// another in their section (1,200 views for 75 MiB in one stretch). When
+/// the 64 KiB pages that hold `[start, start + len)` are one run of one
+/// section ([`Cover::Run`]), the run is mapped once more, whole, at an
+/// address of ours and the heap is opened there: the same pages, so nothing
+/// is copied either way, and the title's own views stay as they are. When
+/// the title maps other pages there, the copy goes as any in place does.
+///
+/// Port of Belobug 0434b3a (copy-back 36 -> 12 ms a frame on an AMD card),
+/// onto the fork's view table ([`title_memory_view`]).
+pub(crate) fn place_stretch(device: &ID3D12Device, start: u64, len: u64) -> Result<Placed, Option<windows::core::Error>> {
+    use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+    let Some((at, bytes)) = aligned_span(start, len) else {
+        return Err(None);
+    };
+    if bytes < STRETCH_LEAST {
+        return Err(None);
+    }
+    let Cover::Run(section, offset) = cover(at as usize, bytes as usize) else {
+        return Err(None);
+    };
+    // A view starts on the allocation granularity, in memory and in its
+    // section alike.
+    if !offset.is_multiple_of(K64 as u64) {
+        return Err(None);
+    }
+    // SAFETY: the runtime's section, alive while the title has views of it
+    // (and while ours stands); the stretch lies inside it.
+    let view = unsafe { MapViewOfFile(section as *mut _, FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, bytes as usize) }.Value as usize;
+    if view == 0 {
+        if STATS[5].load(Ordering::Relaxed) < 8 {
+            tracing::warn!(
+                error = %std::io::Error::last_os_error(),
+                start = format_args!("{at:#x}"),
+                bytes,
+                "a stretch of title memory could not be mapped again"
+            );
+        }
+        return Err(None);
+    }
+    let own = OwnView(view);
+    let heap = open(device, From::Part(view, bytes as usize)).map_err(Some)?;
+    let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= 32 || count.is_power_of_two() {
+        tracing::info!(count, start = format_args!("{at:#x}"), bytes, "title memory in place through a view of ours");
+    }
+    Ok(Placed { buffer, heap, gpu, bias: start - at, own: Some(own) })
 }
 
 /// What [`place_for`] asks of the runtime's switches, gathered so a test can
@@ -230,8 +313,11 @@ fn place_for_with(switches: Switches, start: u64, len: u64, window: bool) -> Opt
     if switches.level < if window { 1 } else { 2 } {
         return None;
     }
-    // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
+    // View memory: known from the runtime without asking Windows. A window
+    // over one run of one section is opened through a view of ours
+    // ([`place_stretch`]); other view memory is copied.
+    let view = cover(start as usize, len as usize) != Cover::None;
+    if view && !(window && stretch_on()) {
         STATS[4].fetch_add(1, Ordering::Relaxed);
         return None;
     }
@@ -264,7 +350,8 @@ fn place_for_with(switches: Switches, start: u64, len: u64, window: bool) -> Opt
         release(locked);
         return None;
     };
-    match place_part(&host.device, start, len) {
+    let placed = if view { place_stretch(&host.device, start, len) } else { place_part(&host.device, start, len) };
+    match placed {
         Ok(placed) => {
             let at = if window { 0 } else { 2 };
             STATS[at].fetch_add(1, Ordering::Relaxed);
@@ -307,7 +394,7 @@ pub(crate) fn gone(window: bool, start: u64, len: u64) {
 /// the runtime to call before the title's own `VirtualFree` once it takes
 /// that call over.
 pub fn title_memory_freeing(at: usize, len: usize) {
-    if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
+    if len == 0 || STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
         return;
     }
     let gone = crate::shadow::in_place_let_go(at as u64, len as u64);
@@ -378,6 +465,7 @@ fn buffer_desc(size: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
 /// A buffer of `size` bytes at `offset` (a multiple of 64 KiB) of an
 /// opened heap, which shaders may read and write, in the common state.
 pub(crate) fn place(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size: u64) -> windows::core::Result<ID3D12Resource> {
+    crate::census::made(7, size);
     let mut placed: Option<ID3D12Resource> = None;
     // The heap is cross-adapter shared, so the buffer must say so too.
     let flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -501,6 +589,30 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     crate::watch::views_mapped(section, offset, len);
 }
 
+/// For the census (`crate::census`): how many bytes of `[at, at + len)` are
+/// physical-page views, and how many of those show a page that has more
+/// than one address. Logging only.
+pub(crate) fn view_census(at: usize, len: usize) -> (usize, usize) {
+    let v = views();
+    let end = at.saturating_add(len);
+    let (mut in_views, mut multi) = (0, 0);
+    for (&base, &(vlen, section, offset)) in v.views.range(..end) {
+        let (lo, hi) = (base.max(at), (base + vlen).min(end));
+        if lo >= hi {
+            continue;
+        }
+        in_views += hi - lo;
+        let first = (lo - base) / K64;
+        let last = (hi - base).div_ceil(K64);
+        for k in first..last {
+            if v.pages.get(&(section, offset + (k * K64) as u64)).is_some_and(|l| l.len() > 1) {
+                multi += (base + (k + 1) * K64).min(hi) - (base + k * K64).max(lo);
+            }
+        }
+    }
+    (in_views, multi)
+}
+
 /// Whether `at` lies in a view the runtime told us it mapped
 /// ([`title_memory_view`]) and has not remapped since: view memory, which
 /// the kernel's write watch cannot answer for (`crate::watch`).
@@ -513,12 +625,16 @@ pub(crate) fn shows_view(at: usize) -> bool {
 /// the views that touch it are forgotten (the runtime tells again those it
 /// maps anew).
 pub(crate) fn views_gone(at: usize, len: usize) {
+    // (A zero length would make an inverted range below: fxceless #622.)
+    if len == 0 {
+        return;
+    }
     let mut v = views();
     if v.views.is_empty() {
         return;
     }
     let end = at.saturating_add(len);
-    let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
+    let first = v.views.range(..=at).next_back().filter(|(base, view)| base.saturating_add(view.0) > at).map(|(base, _)| *base);
     let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
     for base in gone {
         let Some((bytes, section, offset)) = v.views.remove(&base) else {

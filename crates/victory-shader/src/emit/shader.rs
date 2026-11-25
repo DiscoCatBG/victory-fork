@@ -73,8 +73,14 @@ pub const SLOT_MEMORY: u8 = 254;
 pub const SLOT_FAULTS: u8 = 253;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
-/// Dwords of the [`SLOT_FAULTS`] buffer.
+/// Dwords of the fault notes at the start of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// After the fault notes in the [`SLOT_FAULTS`] buffer: one dword per
+/// copy number (dword [`MEMORY_FAULTS`] + n for number `n`, 0 being no
+/// copy), set to 1 by every store and atomic a running lane makes through
+/// that copy. The host reads and clears them to learn which copies shaders
+/// write, so that it need not take every copy for written (fxceless #346).
+pub const MEMORY_MARKS: u32 = 8192;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;
@@ -93,12 +99,19 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
+/// `RootType::Other` code of a user-data dword the host sets: the number of
+/// the first thread group in x. The console dispatches any number of groups
+/// in one dimension; the host at most 65,535, so a larger dispatch runs in
+/// parts, each with the groups before it here. Asked for by compute programs
+/// that are told the x number alone (the one-dimensional ones).
+pub const USER_GROUP_BASE: u32 = 0x104;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     /// `[earlydepthstencil]` (`ForceEarlyDepthStencil`): depth and stencil
     /// are tested before the program runs. It has no feature bit.
     pub const EARLY_DEPTH: u64 = 1 << 3;
+    pub const NO_REFACTORING: u64 = 1 << 1;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
@@ -124,6 +137,9 @@ pub(crate) struct Types {
     pub cbuf_ret: Ty,
     pub res_ret: Ty,
 }
+
+/// Resource properties, word 0: a globally coherent UAV (bit 14).
+pub(crate) const COHERENT: u32 = 0x4000;
 
 /// What a mesh shader declares beyond its thread-group size.
 #[derive(Debug, Clone, Copy)]
@@ -185,11 +201,15 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Every UAV the shader opens is rasterizer ordered ([`Self::annotate`]).
     pub rov: bool,
+    /// A fused multiply-add (`FMad`) was emitted: the driver may then fuse.
+    pub fused: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
     /// Resource properties of each heap handle made, in creation order.
     #[cfg(test)]
     pub heap_props: Vec<(u32, u32)>,
+    /// Every UAV globally coherent (see `lower::wants_coherent`).
+    pub coherent: bool,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -246,9 +266,11 @@ impl Shader {
             root_uavs: Vec::new(),
             flags: 0,
             rov: false,
+            fused: false,
             nonuniform_handles: 0,
             #[cfg(test)]
             heap_props: Vec::new(),
+            coherent: false,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -382,7 +404,8 @@ impl Shader {
             217,
             &[bind, r, f],
         );
-        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        let props = 11 | 0x1000 | if self.coherent { COHERENT } else { 0 };
+        let h = self.annotate(block, h, props, 0);
         self.flags |= flags::RAW_BUFFERS;
         self.root_uavs.push((slot, h));
         h
@@ -494,6 +517,12 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(count_nonuniform);
+        // Resource properties: bit 12 a UAV, bit 14 globally coherent.
+        let props = if self.coherent && props.0 & 0x1000 != 0 {
+            (props.0 | COHERENT, props.1)
+        } else {
+            props
+        };
         #[cfg(test)]
         self.heap_props.push(props);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
@@ -506,6 +535,14 @@ impl Shader {
             &[index, s, n],
         );
         self.annotate(block, h, props.0, props.1)
+    }
+
+    /// Refactoring lets the host fuse a multiply and an add the console
+    /// rounds apart (Intel UHD does); only `FMad` needs it, to fuse at all.
+    pub(crate) fn settle_flags(&mut self) {
+        if !self.fused {
+            self.flags |= flags::NO_REFACTORING;
+        }
     }
 
     /// The finished container.
@@ -655,6 +692,8 @@ impl Shader {
                 let u = self.m.undef(p);
                 let no = self.m.bool(false);
                 let no = self.m.md_value(no);
+                let coherent = self.m.bool(self.coherent);
+                let coherent = self.m.md_value(coherent);
                 let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
                     // Id, variable, name, space, lower bound, range size,
@@ -670,7 +709,7 @@ impl Shader {
                         Some(i32c(&mut self, u32::from(slot))),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
-                        Some(no),
+                        Some(coherent),
                         Some(no),
                         Some(ordered),
                         None,
@@ -778,6 +817,7 @@ impl Shader {
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
         }
+        self.settle_flags();
         // Entry properties: shader flags (tag 0), geometry state (1),
         // thread-group size (4), wave size (11).
         let mut props = Vec::new();

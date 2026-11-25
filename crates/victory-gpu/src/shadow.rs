@@ -82,8 +82,9 @@ pub(crate) struct Shadow {
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
     /// and the bytes from the buffer's first byte to `start` (the heap
-    /// begins on a 64 KiB line; a title buffer need not).
-    place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// begins on a 64 KiB line; a title buffer need not), and for view
+    /// memory the view of ours the heap is on (`inplace::place_stretch`).
+    place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64, Option<crate::inplace::OwnView>)>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -108,6 +109,23 @@ struct Card {
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
+
+/// Whether a refresh compares the pages the title wrote with the copy and
+/// puts in only the 4 KiB pieces that differ (`VICTORY_COPY_COMPARE=1`; off
+/// by default). The write watch tells which pages were written, not whether
+/// their bytes changed; in a still scene the title writes 100-150 MB a
+/// frame of its buffers again, and for a copy in the card's memory every
+/// such byte went up and was hashed there again. With the switch a piece
+/// written with the bytes it held stays as it is: not copied, not sent up.
+pub(crate) fn copy_compare() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_COMPARE").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line, with [`copy_compare`]: bytes the title
+/// wrote that a refresh compared, and of them those that held what the
+/// copy held (not put in, not sent up).
+pub(crate) static COPY_COMPARED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Whether the host copies of big title buffers are in the card's own
 /// memory (on by default since run 75 showed it holds: the BVH skinning
@@ -2160,6 +2178,41 @@ fn changed_chunks(now: &[u8], was: &[u8], chunk: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// Whether a merge writes back only the runs of bytes the card changed, not
+/// the whole stretch from the first to the last of them (fxceless #786): a
+/// byte the title writes in a gap between the read and the write back then
+/// keeps the title's value. `VICTORY_MERGE_RUNS=0` writes the stretch.
+fn merge_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_MERGE_RUNS").map_or(true, |v| v != "0"))
+}
+
+/// The runs the card changed in a stretch about to be merged (`now` against
+/// the reference), or `None` where the whole stretch is written.
+/// (A stretch in many runs is written whole, as before: each write outside
+/// a view of our own asks the kernel about its pages.)
+fn card_runs(now: &[u8], held: &[u8]) -> Option<Vec<(usize, usize)>> {
+    const MOST: usize = 8;
+    if !merge_runs() {
+        return None;
+    }
+    Some(changed_runs(now, held)).filter(|runs| runs.len() <= MOST)
+}
+
+/// Writes the merged stretch `title` back at title address `at`: its `runs`
+/// alone, or all of it without them.
+fn put_runs(at: usize, title: &[u8], runs: Option<&[(usize, usize)]>) {
+    let write = crate::host::TitleWrite::open(at, title.len());
+    match runs {
+        Some(runs) => {
+            for &(r, m) in runs {
+                write.put(at + r, title[r..].as_ptr(), m);
+            }
+        }
+        None => write.put(at, title.as_ptr(), title.len()),
+    }
+}
+
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
@@ -2365,8 +2418,15 @@ impl Drop for Shadow {
             // one of them may still read through it (HailLucifer666,
             // fxceless/victory-fork#943). The buffer placed in it is a field,
             // dropped after this returns, so it goes first.
-            if let Some((heap, _bias)) = self.place.take() {
-                crate::host::retire(heap);
+            // A view of ours under the heap (`inplace::place_stretch`) is
+            // unmapped only after the buffer and the heap are gone: the
+            // retired tuple holds a reference to the buffer too and drops
+            // in order.
+            if let Some((heap, _bias, own)) = self.place.take() {
+                match own {
+                    Some(own) => crate::host::retire((self.buffer.clone(), heap, own)),
+                    None => crate::host::retire(heap),
+                }
             }
             return;
         }
@@ -2675,6 +2735,11 @@ unsafe impl Send for Shadow {}
 unsafe impl Sync for Shadow {}
 
 impl Shadow {
+    /// Where the title buffer starts (`crate::census`).
+    pub(crate) fn title_start(&self) -> u64 {
+        self.start
+    }
+
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)
@@ -2908,7 +2973,7 @@ impl Shadow {
         LIVE[1].fetch_sub(len, Ordering::Relaxed);
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
-        shadow.place = Some((placed.heap, placed.bias));
+        shadow.place = Some((placed.heap, placed.bias, placed.own));
         shadow
     }
 
@@ -3247,10 +3312,12 @@ impl Shadow {
         // The stretch as read: what the card did not change is the
         // title's, and may have been written again since.
         let as_read = merge_race_on().then(|| title.clone());
+        // The card's bytes, found before the merge takes them into `held`.
+        let runs = card_runs(now, held);
         if !merge_piece(now, held, title) {
             return 0;
         }
-        crate::host::TitleWrite::open(start + at, n).put(start + at, title.as_ptr(), n);
+        put_runs(start + at, title, runs.as_deref());
         n
     }
 
@@ -3696,7 +3763,20 @@ impl Shadow {
                 }
                 return copied;
             }
-            self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+            // `GetWriteWatch` refuses a range that spans two reservations as
+            // a whole (`watch::writes` returns None). Splitting it keeps the
+            // rest of the buffer watched instead of copying all of it every
+            // frame: only the piece that cannot be watched is copied.
+            if to - from > PAGE {
+                let mid = ((from + to) / 2) & !(PAGE - 1);
+                if mid > from && mid < to {
+                    let left = self.update_free(from, mid);
+                    return left + self.update_free(mid, to);
+                }
+            }
+            if to - from > PAGE {
+                self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+            }
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
@@ -3809,6 +3889,9 @@ impl Shadow {
         if self.card.is_some() && from < to && copy_changed() && self.copy_changed(from, to) {
             return to - from;
         }
+        if from < to && copy_compare() {
+            return self.copy_compared(from, to);
+        }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
@@ -3863,6 +3946,47 @@ impl Shadow {
                 );
             }
             true
+        })
+    }
+
+    /// [`Shadow::copy`] with [`copy_compare`]: title memory `[from, to)` is
+    /// read into scratch memory, and only the 4 KiB pieces that differ from
+    /// the copy are put in and noted changed (for snapshots and for the
+    /// card's side). Returns the bytes that differed.
+    fn copy_compared(&self, from: usize, to: usize) -> usize {
+        const PIECE: usize = 4096;
+        let start = self.start as usize;
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        SCRATCH.with(|s| {
+            let mut title = s.borrow_mut();
+            title.clear();
+            title.resize(to - from, 0);
+            crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, to - from, false);
+            // SAFETY: inside the mapping (`from` and `to` are within the buffer).
+            let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), to - from) };
+            let (mut changed, mut run): (usize, Option<usize>) = (0, None);
+            let mut at = 0;
+            while at <= title.len() {
+                let end = (at + PIECE).min(title.len());
+                let differs = at < title.len() && title[at..end] != held[at..end];
+                if differs {
+                    run.get_or_insert(at);
+                } else if let Some(first) = run.take() {
+                    held[first..at].copy_from_slice(&title[first..at]);
+                    self.changed(from - start + first, from - start + at);
+                    self.card_changed(from - start + first, from - start + at);
+                    changed += at - first;
+                }
+                if at == title.len() {
+                    break;
+                }
+                at = end;
+            }
+            COPY_COMPARED[0].fetch_add((to - from) as u64, Ordering::Relaxed);
+            COPY_COMPARED[1].fetch_add((to - from - changed) as u64, Ordering::Relaxed);
+            changed
         })
     }
 
@@ -4000,10 +4124,11 @@ impl Shadow {
         let mut written = 0;
         let mut upload = false;
         if crate::host::read_into((start + at) as *const u8, title) {
+            let runs = card_runs(gpu, old);
             let (write_title, write_card) = merged_destinations(old, gpu, title);
             upload = write_card;
             if write_title {
-                crate::host::TitleWrite::open(start + at, n).put(start + at, title.as_ptr(), n);
+                put_runs(start + at, title, runs.as_deref());
                 written = n;
             }
         } else {
@@ -4180,10 +4305,17 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+/// A reader-writer lock: [`lookup`] finds a buffer whose copy is made
+/// under a shared lock, and the recording threads do so at every draw
+/// (PalmVIDev #221 from fxceless #867, powplusplus).
+static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> = std::sync::RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
+}
+
+fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.read().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Of title memory `[from, to)`: the parts that title buffer objects hold,
@@ -4213,13 +4345,18 @@ pub(crate) fn buffer_parts(from: u64, to: u64) -> Vec<(u64, u64)> {
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let before = buffers().insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
         },
     );
+    // A buffer made again at the same place and address: its old copy may
+    // still be named by lists and descriptors, as one the title released.
+    if let Some(shadow) = before.and_then(|e| e.shadow) {
+        crate::host::retire(shadow);
+    }
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
@@ -4315,6 +4452,21 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
+    let enclosing = |map: &BTreeMap<(u64, usize), Entry>| {
+        map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end).map(|(k, _)| *k)
+    };
+    // Under the shared lock first: a buffer whose copy is made is what
+    // most asks find.
+    {
+        let map = buffers_read();
+        let Some(key) = enclosing(&map) else {
+            drop(map);
+            return loose(address, end, len <= 1, any);
+        };
+        if let Some(shadow) = map.get(&key).and_then(|e| e.shadow.as_ref()) {
+            return Some(shadow.clone());
+        }
+    }
     let mut map = buffers();
     let key = map
         .range(..=(address, usize::MAX))
@@ -4337,6 +4489,28 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && size >= card_limits().0;
+        // Folded (`VICTORY_FOLD_BUFFERS=1`): a small buffer inside one
+        // window cell takes the cell's window as its copy, so that the
+        // buffer and the memory around it, which the title also reaches by
+        // address, are one copy. Two copies of the same bytes made every
+        // submission that refreshed one while a flight's shaders wrote the
+        // other wait for the card to drain: ~2.8 times a frame in the
+        // world, for 10-40 KB each (a 6.4 KB ring and a 465 KB buffer
+        // inside 4 MiB windows). One copy's own pending writes are left
+        // alone by its refresh and need no such wait.
+        if !big && fold_buffers() && !fine() && key.0 & !(WINDOW - 1) == (entry.end - 1) & !(WINDOW - 1) {
+            if let Some(window) = loose(key.0, entry.end, false, false) {
+                if FOLDED.fetch_add(1, Ordering::Relaxed) < 24 {
+                    tracing::info!(
+                        start = format_args!("{:#x}", key.0),
+                        len,
+                        "a buffer's copy is its window's (VICTORY_FOLD_BUFFERS=1)"
+                    );
+                }
+                entry.shadow = Some(window);
+                return entry.shadow.clone();
+            }
+        }
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
@@ -4353,6 +4527,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     len,
                     "a buffer's host copy is in the card's memory"
                 );
+                crate::census::copy_made(key.0, len);
                 let card = Card {
                     staging: buffer,
                     before: Mutex::default(),
@@ -4389,6 +4564,16 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     }
     entry.shadow.clone()
 }
+
+/// Whether small title buffers inside one window cell share the cell's
+/// window as their copy (`VICTORY_FOLD_BUFFERS=1`; off by default).
+fn fold_buffers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FOLD_BUFFERS").is_some_and(|v| v == "1"))
+}
+
+/// Buffers folded into windows so far ([`fold_buffers`]).
+pub(crate) static FOLDED: AtomicU64 = AtomicU64::new(0);
 
 /// Titles also use memory outside any buffer object as GPU memory (
 /// the title's interface vertices, from its own allocator). Such memory

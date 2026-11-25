@@ -15,8 +15,9 @@
 //! Library calls overlap: the host documents the library as safe to use
 //! from several threads ("The pipeline library is thread-safe to use, and
 //! will internally synchronize as necessary", `CreatePipelineLibrary`,
-//! Thread Safety), with one exception kept here: two loads of the same
-//! pipeline are made one after the other ([`same_name`]). Under one lock of
+//! Thread Safety). Each name is held across load, creation and store
+//! ([`same_name`]), so another request for the same pipeline can load it
+//! after a successful store. Different names can overlap. Under one lock of
 //! ours for every call, the eight workers made pipelines one at a time:
 //! 87 to 96 of 110 looks at each worker found it waiting for that lock
 //! (run 49), and an earlier run's 2,300 pipelines, all in the library, were
@@ -50,7 +51,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, OnceLock, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -415,14 +416,29 @@ unsafe impl Send for Library {}
 // SAFETY: as above; the other fields are an atomic and a lock.
 unsafe impl Sync for Library {}
 
-/// Held by a load of the pipeline named `name`: loads of the same name
-/// wait for each other (the host's one exception to the library's thread
-/// safety: such a load may change that pipeline's entry). Names share 64
-/// locks, so two different names seldom wait.
-fn same_name(name: &str) -> MutexGuard<'static, ()> {
-    static LOADING: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
-    let at = name.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(usize::from(b)));
-    LOADING[at % LOADING.len()].lock().unwrap_or_else(|e| e.into_inner())
+static HELD_NAMES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+static NAME_RELEASED: Condvar = Condvar::new();
+
+struct HeldName<'a>(&'a str);
+
+/// Holds the exact library name until the load succeeds or creation and
+/// storage finish. The mutex only protects the set of names in flight.
+fn same_name(name: &str) -> HeldName<'_> {
+    let mut held = HELD_NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    while held.contains(name) {
+        #[cfg(test)]
+        concurrency_tests::waiting_for_name();
+        held = NAME_RELEASED.wait(held).unwrap_or_else(|e| e.into_inner());
+    }
+    held.insert(name.to_owned());
+    HeldName(name)
+}
+
+impl Drop for HeldName<'_> {
+    fn drop(&mut self) {
+        HELD_NAMES.lock().unwrap_or_else(|e| e.into_inner()).remove(self.0);
+        NAME_RELEASED.notify_all();
+    }
 }
 
 /// With `VICTORY_LIBRARY_LOCK=1`: held by every library call, as before.
@@ -687,9 +703,9 @@ pub(crate) fn pipeline(
         return create_guarded(name, create);
     };
     let began = std::time::Instant::now();
+    let _one = same_name(name);
     let loaded = {
         let _all = one_call();
-        let _one = same_name(name);
         let _call = call("load", name);
         load(&library.library, PCWSTR(wide.as_ptr()))
     };
@@ -707,7 +723,7 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
-    // Compiled outside any lock: compiles take up to seconds.
+    // Compiles take up to seconds. Keep only this name held.
     let pso = {
         let _call = call("make", name);
         create_guarded(name, create)?
@@ -721,14 +737,97 @@ pub(crate) fn pipeline(
         )
     });
     let _all = one_call();
-    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
-    let _call = call("store", name);
+    // A save holds the library alone while it serialises it (seconds to
+    // minutes for a library of gigabytes): the store waits for after it
+    // instead of the worker ([`DEFERRED`]).
+    let _stores = match library.saving.try_read() {
+        Ok(held) => held,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            defer_store(wide, &pso);
+            return Ok(pso);
+        }
+    };
+    {
+        let _call = call("store", name);
+        store(library, &wide, &pso);
+    }
+    store_deferred(library);
+    Ok(pso)
+}
+
+/// Stores `pso` under `name`, with the library's store lock held (shared);
+/// whether the library took it.
+fn store(library: &Library, name: &HSTRING, pso: &ID3D12PipelineState) -> bool {
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+    let stored = unsafe { library.library.StorePipeline(PCWSTR(name.as_ptr()), pso) }.is_ok();
+    if stored {
         library.added.fetch_add(1, Ordering::Relaxed);
     }
-    Ok(pso)
+    stored
+}
+
+/// A pipeline made while a save held the library, to be stored after it.
+struct Deferred(HSTRING, ID3D12PipelineState);
+
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for Deferred {}
+
+/// At most this many stores wait for a save; past it a pipeline is not
+/// stored (the next run compiles it again), so that a save that never ends
+/// does not hold host pipelines without bound.
+const DEFERRED_MAX: usize = 4096;
+
+/// Stores that found a save holding the library (PalmVIDev #255). A save
+/// of a 7 GB library took over three minutes on a world run (RTX 4090,
+/// little physical memory free), and every pipeline worker waited for it
+/// in its store with its pipeline already made: 16 of 16 workers "busy"
+/// at 0.2 processors, and the frame's queued pipelines made a few a
+/// minute. Now the worker hands its pipeline on at once and the store
+/// waits here.
+static DEFERRED: Mutex<Vec<Deferred>> = Mutex::new(Vec::new());
+
+/// Stores deferred while a save held the library, since the start.
+static DEFERRED_STORES: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a list of `len` deferred stores has room for one more.
+fn defer_room(len: usize) -> bool {
+    len < DEFERRED_MAX
+}
+
+/// Keeps `pso` for a store after the save in progress.
+fn defer_store(name: HSTRING, pso: &ID3D12PipelineState) {
+    let mut deferred = DEFERRED.lock().unwrap_or_else(|e| e.into_inner());
+    if defer_room(deferred.len()) {
+        deferred.push(Deferred(name, pso.clone()));
+        DEFERRED_STORES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Stores the deferred pipelines; the caller holds the store lock (shared).
+fn store_deferred(library: &Library) {
+    let waiting = std::mem::take(&mut *DEFERRED.lock().unwrap_or_else(|e| e.into_inner()));
+    if waiting.is_empty() {
+        return;
+    }
+    let _call = call("store", "pipelines made during a save");
+    for Deferred(name, pso) in &waiting {
+        store(library, name, pso);
+    }
+}
+
+/// After a save: stores what waited for it, unless another save holds the
+/// library already (that one stores them after itself).
+fn store_deferred_after_save(library: &Library) {
+    let _all = one_call();
+    let held = match library.saving.try_read() {
+        Ok(held) => held,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    store_deferred(library);
+    drop(held);
 }
 
 /// Writes the library and the early list if pipelines were added since the
@@ -777,6 +876,7 @@ pub(crate) fn save(now: bool) {
             size
         }
     };
+    store_deferred_after_save(library);
     // With what earlier runs listed: a run that asks for no title pipeline
     // (`victory warm`) wrote an empty list over theirs, and the next world
     // began with every pipeline still to be asked for.
@@ -807,6 +907,7 @@ pub(crate) fn save(now: bool) {
             started_early = EARLY.load(Ordering::Relaxed),
             retried_out_of_memory = OOM_RETRIED.load(Ordering::Relaxed),
             recovered_out_of_memory = OOM_RECOVERED.load(Ordering::Relaxed),
+            deferred_stores = DEFERRED_STORES.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
@@ -896,6 +997,21 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store never waits for a save: while one holds the library alone,
+    /// the store lock cannot be had shared without waiting, which is what
+    /// sends a store to the deferred list (bounded).
+    #[test]
+    fn a_store_during_a_save_does_not_wait() {
+        let saving = RwLock::new(());
+        let alone = saving.write().unwrap();
+        assert!(matches!(saving.try_read(), Err(std::sync::TryLockError::WouldBlock)));
+        drop(alone);
+        assert!(saving.try_read().is_ok());
+        assert!(defer_room(0));
+        assert!(defer_room(DEFERRED_MAX - 1));
+        assert!(!defer_room(DEFERRED_MAX));
+    }
 
     fn out_of_memory() -> windows::core::Error {
         windows::Win32::Foundation::E_OUTOFMEMORY.into()
@@ -1089,3 +1205,6 @@ mod tests {
         assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
     }
 }
+
+#[cfg(test)]
+mod concurrency_tests;

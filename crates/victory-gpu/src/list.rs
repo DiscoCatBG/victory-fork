@@ -127,6 +127,10 @@ struct List {
     /// at them before it runs `host`.
     #[cfg(windows)]
     gate: Vec<ValueWait>,
+    /// The list of hoisted clamps that runs right before `host`, still
+    /// open ([`hoist`], `crate::indirect::hoisting`).
+    #[cfg(windows)]
+    clamps: Option<crate::host::HostList>,
 }
 
 /// One part of a title list cut at its waits: the waits the queue stands
@@ -315,6 +319,8 @@ fn cut(this: This, wait: ValueWait) {
     // SAFETY: the title passes one of our lists; a list is recorded by one
     // thread at a time and is not submitted while it records.
     let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    // Hoisted clamps run before what was recorded, so before the wait.
+    end_hoist(list);
     let Some(current) = list.host.as_ref() else {
         return;
     };
@@ -348,8 +354,74 @@ fn cut(this: This, wait: ValueWait) {
     }
 }
 
+/// Ends the hoist of a list's clamps, if one is open ([`hoist`]): the
+/// list of hoisted clamps is closed and becomes the part before the
+/// current host list, standing at the waits that stood before that one;
+/// and the draw state no longer hoists.
+#[cfg(windows)]
+fn end_hoist(list: &mut List) {
+    if let Some(clamps) = list.clamps.take() {
+        clamps.close();
+        let waits = std::mem::take(&mut list.gate);
+        list.earlier.push(Part { waits, host: clamps });
+    }
+    list.state.lock().unwrap_or_else(|e| e.into_inner()).end_hoist();
+}
+
+/// Before an indirect draw of list `this` (`crate::indirect::hoisting`):
+/// the open list its clamp goes to, before the current host list. While
+/// the draw state says the hoist still holds (nothing recorded since it
+/// began may have written arguments), that is the list already open.
+/// Otherwise the recording is cut here, as at a wait ([`cut`]): what was
+/// recorded becomes a part of its own, a new list for the clamps of the
+/// draws to come follows it, and the recording goes on in another host
+/// list after that, with the state the title set. With nothing recorded
+/// yet nothing is cut. None (the draw is clamped before it, as always) if
+/// there is no list to be had.
+/// (belobug/victory-belobug-amd ccab9730, afca1890; PalmVIDev #248.)
+#[cfg(windows)]
+fn hoist<'a>(this: This) -> Option<&'a crate::host::HostList> {
+    if this.is_null() || !crate::indirect::hoisting() {
+        return None;
+    }
+    // SAFETY: the title passes one of our lists; a list is recorded by one
+    // thread at a time and is not submitted while it records.
+    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    let current = list.host.as_ref()?;
+    if list.clamps.is_some() && list.state.lock().unwrap_or_else(|e| e.into_inner()).hoisting_into(current) {
+        return list.clamps.as_ref();
+    }
+    end_hoist(list);
+    let current = list.host.as_ref()?;
+    let touched = !current.untouched();
+    let clamps = fresh_list()?;
+    if touched {
+        // (Without a list to go on in, the one for the clamps is let go.)
+        let fresh = fresh_list()?;
+        current.close();
+        if let Some(done) = list.host.replace(fresh) {
+            let waits = std::mem::take(&mut list.gate);
+            list.earlier.push(Part { waits, host: done });
+        }
+    }
+    let host = list.host.as_ref()?;
+    {
+        let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+        if touched {
+            state.replay(host);
+        }
+        state.hoist_into(host);
+    }
+    list.clamps = Some(clamps);
+    static HOISTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if HOISTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+        tracing::info!(cut = touched, "the clamps of a run of indirect draws go to a list before it");
+    }
+    list.clamps.as_ref()
+}
+
 /// Whether list `this` recorded a wait for a memory value (with waits cut
-/// into lists).
+/// into lists), or was cut for hoisted clamps.
 #[cfg(windows)]
 pub(crate) fn cut_list(this: This) -> bool {
     if this.is_null() {
@@ -358,7 +430,7 @@ pub(crate) fn cut_list(this: This) -> bool {
     // SAFETY: one of our lists, closed and submitted: nothing records
     // into it.
     let list = unsafe { &*this.cast::<List>() };
-    !list.earlier.is_empty() || !list.gate.is_empty()
+    !list.earlier.is_empty() || !list.gate.is_empty() || list.clamps.is_some()
 }
 
 /// What a queue is given for submitted lists that were cut at their waits:
@@ -408,6 +480,8 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        // (Closed by the title's close; submitted without one, closed here.)
+        end_hoist(list);
         let Some(host) = list.host.replace(fresh) else {
             continue;
         };
@@ -601,6 +675,8 @@ fn new_list(
         earlier: Vec::new(),
         #[cfg(windows)]
         gate: Vec::new(),
+        #[cfg(windows)]
+        clamps: None,
     });
     #[cfg(not(windows))]
     let _ = pipeline;
@@ -630,6 +706,13 @@ extern "system" fn list_type(this: This) -> u32 {
     unsafe { (*this.cast::<List>()).kind }
 }
 extern "system" fn close(this: This) -> HRESULT {
+    // Hoisted clamps become the part before the list's last.
+    #[cfg(windows)]
+    if !this.is_null() {
+        // SAFETY: the title passes one of our lists, and records nothing
+        // into it while it closes it.
+        end_hoist(unsafe { &mut *this.cast_mut().cast::<List>() });
+    }
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
@@ -656,6 +739,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         // SAFETY: the title passes one of our lists, and neither records
         // into it nor submits it during its reset.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        list.clamps = None;
         list.earlier.clear();
         list.gate.clear();
     }
@@ -664,8 +748,9 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         host.reset();
         state.reset(pipeline);
     });
+    crate::pipeline::bound(pipeline);
     #[cfg(not(windows))]
-    let _ = (this, pipeline);
+    let _ = this;
     S_OK
 }
 
@@ -868,6 +953,7 @@ extern "system" fn copy_buffer_region(
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
+        && !gpu_buffer_copy(list, to, from, len as usize)
     {
         list.defer_copy(to, from, len as usize);
     }
@@ -953,12 +1039,77 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            list.defer_copy(to, from, a.min(b) as usize);
+            if !gpu_buffer_copy(list, to, from, a.min(b) as usize) {
+                list.defer_copy(to, from, a.min(b) as usize);
+            }
         }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src);
 }
+
+/// Whether a title buffer copy runs on the card (`VICTORY_GPU_BUFFER_COPY`,
+/// on unless 0), only where the copy at submission on the CPU would read or
+/// write bytes a flight in the air may write: that copy has to wait for the
+/// flights to land (a settle, about one a frame in the world once the
+/// refresh settles were gone), where the card runs a copy in its queue's
+/// order, behind them, as the console does. The source's host copy is
+/// brought up to date first, the destination's range is declared written
+/// by the card (it comes back into title memory with what shaders wrote).
+/// False if it could not: the caller copies on the CPU as before.
+#[cfg(windows)]
+fn gpu_buffer_copy(list: &crate::host::HostList, to: *mut u8, from: *const u8, len: usize) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_GPU_BUFFER_COPY").is_none_or(|v| v != "0")) {
+        return false;
+    }
+    let (dst, src) = (to as usize, from as usize);
+    if len == 0
+        || !crate::host::late()
+        || !(crate::host::flights_write(src, src + len) || crate::host::flights_write(dst, dst + len))
+    {
+        return false;
+    }
+    let (Some(d), Some(s)) = (
+        crate::shadow::find(dst as u64, len as u64),
+        crate::shadow::find(src as u64, len as u64),
+    ) else {
+        return false;
+    };
+    // Both copies must hold the whole range, and one buffer may not copy
+    // over itself where the ranges overlap.
+    let (Some(d_at), Some(s_at)) = (d.offset_in(dst as u64), s.offset_in(src as u64)) else {
+        return false;
+    };
+    if d.left(dst as u64) < len as u64 || s.left(src as u64) < len as u64 {
+        return false;
+    }
+    if std::sync::Arc::ptr_eq(&d, &s) && src < dst + len && dst < src + len {
+        return false;
+    }
+    s.refresh(list, src as u64, len as u64);
+    d.refresh(list, dst as u64, len as u64);
+    d.gpu_writes(list, dst as u64, len as u64);
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("title buffer copy on the card {src:#x} -> {dst:#x} ({len} bytes)"));
+    let uav = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER {
+        Type: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        ..Default::default()
+    };
+    // SAFETY: an open list; both host copies are live and hold the ranges
+    // (checked above). Shaders' writes before the copy first, then the
+    // copy's before what follows.
+    unsafe {
+        list.list.ResourceBarrier(&[uav.clone()]);
+        list.list.CopyBufferRegion(&d.buffer, d_at, &s.buffer, s_at, len as u64);
+        list.list.ResourceBarrier(&[uav]);
+    }
+    GPU_BUFFER_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// Title buffer copies run on the card ([`gpu_buffer_copy`]).
+pub(crate) static GPU_BUFFER_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
     copy_resource(this, dst, src);
@@ -1432,8 +1583,21 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
             {
-                // SAFETY: both ranges are committed title memory.
-                unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
+                let (s, d) = (src as usize, dst as usize);
+                if s.saturating_add(len) <= d || d.saturating_add(len) <= s {
+                    // The answer above is only a hint: the title may unmap
+                    // either range before the copy (a plain memcpy then
+                    // faulted). Ours reports a fault, and the kernel's copy
+                    // writes what is still there.
+                    // SAFETY: `dst` is title memory the title gave the GPU
+                    // to write; a fault on either range returns false.
+                    if !unsafe { crate::title_copy::copy(dst as *mut u8, src as *const u8, len) } {
+                        crate::host::copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    }
+                } else {
+                    // SAFETY: both ranges are committed title memory.
+                    unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
+                }
             }
         });
     }
@@ -1448,14 +1612,51 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
 
 /// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
 /// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    {
+        let [x, y, z] = dispatch_x_groups(this, [x, y, z], flags);
+        state::dispatch(this, x, y, z);
+    }
     #[cfg(not(windows))]
     {
         let _ = (this, x, y, z);
         count_dispatch();
     }
+}
+
+/// The console's dispatch initiator bit `USE_THREAD_DIMENSIONS`: the
+/// counts are of threads, not groups.
+const USE_THREAD_DIMENSIONS: u32 = 0x20;
+
+/// The groups a `DispatchX` runs. Its flags are the console's dispatch
+/// initiator bits; with [`USE_THREAD_DIMENSIONS`] (the ray-tracing structure
+/// builder's box rehydration, header copies and triangle reloads) the
+/// counts are threads, and taken for groups each ran 64 times its work,
+/// writing far past its structures (fxceless #994, f90061d: 2.2 GiB in a
+/// frame; here a builder run with a white room, 1.8 GB of copies a frame
+/// and the device removed 40 s in, at 7961866).
+/// shortcut: the last group of each dimension runs whole; the console
+/// launches only the threads inside the counts (f90061d translates a form
+/// whose extra threads leave).
+#[cfg(windows)]
+fn dispatch_x_groups(this: This, counts: [u32; 3], flags: u32) -> [u32; 3] {
+    if flags & USE_THREAD_DIMENSIONS == 0 {
+        return counts;
+    }
+    let mut pipeline = None;
+    with_state(this, |_, s| pipeline = Some(s.pipeline_this()));
+    let Some(group) = pipeline.and_then(crate::pipeline::group_size) else {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(?counts, "a dispatch by thread counts whose group size is not known runs them as groups"));
+        return counts;
+    };
+    let groups = std::array::from_fn(|i| counts[i].div_ceil(group[i].max(1)));
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+        tracing::info!(?counts, ?group, ?groups, "a dispatch by thread counts");
+    }
+    groups
 }
 
 /// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
@@ -1727,7 +1928,11 @@ mod state {
     /// programs take `x` groups only.
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
         super::count_draw();
-        if y * z != 1 {
+        // No groups in any dimension: nothing runs.
+        if x == 0 || y == 0 || z == 0 {
+            return;
+        }
+        if y != 1 || z != 1 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
@@ -1808,6 +2013,17 @@ extern "system" fn draw(_: This) {
     count_draw();
 }
 
+/// Checked byte address inside `buffer` at `offset` with at least `min_bytes`
+/// remaining, preventing `u64` address wrap and out-of-bounds aliasing.
+fn buffer_at(buffer: This, offset: u64, min_bytes: u64) -> Option<u64> {
+    let (p, size) = crate::resource::buffer_bytes(buffer)?;
+    let end = offset.checked_add(min_bytes)?;
+    if end > size {
+        return None;
+    }
+    (p as u64).checked_add(offset)
+}
+
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
 /// offset)`. The title's signatures (title+0x2479466, 2026-11-24)
 /// hold one argument each: draw (stride 16), indexed draw (20), dispatch
@@ -1830,8 +2046,15 @@ extern "system" fn execute_indirect(
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
-    let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
-    let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    let min_bytes = if count.is_null() {
+        (max as u64).saturating_mul(stride as u64)
+    } else if max > 0 {
+        stride as u64
+    } else {
+        0
+    };
+    let address = buffer_at(arguments, offset, min_bytes);
+    let counter = buffer_at(count, count_offset, 4);
     let mut ran = false;
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
@@ -1840,8 +2063,10 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        // Draws: their clamps may go to a list before them.
+        let clamps = if kind == DISPATCH { None } else { hoist(this) };
         with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            ran = s.execute_indirect_with(list, clamps, (kind, stride, max), address, counter);
         });
     } else {
         #[cfg(all(windows, feature = "diagnostics"))]
@@ -2149,6 +2374,8 @@ fn value_written(this: This, address: u64, value: u64) {
         // SAFETY: the title passes one of our lists; a list is recorded by
         // one thread at a time and is not submitted while it records.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        // Hoisted clamps run before what was recorded.
+        end_hoist(list);
         let Some(current) = list.host.as_ref() else {
             return;
         };
@@ -2311,6 +2538,17 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// `DispatchMesh` with group counts whose product overflows, or with
+    /// none in a dimension, is no mesh dispatch (and no panic).
+    #[cfg(windows)]
+    #[test]
+    fn mesh_dispatches_with_overflowing_or_zero_groups_do_nothing() {
+        // A null list: the state is never reached.
+        state::dispatch_mesh(std::ptr::null(), 16, 65536, 65536);
+        state::dispatch_mesh(std::ptr::null(), 16, 0, 1);
+        state::dispatch_mesh(std::ptr::null(), 0, 1, 1);
+    }
 
     #[test]
     fn subresource_size_tracks_mips_and_array_slices() {

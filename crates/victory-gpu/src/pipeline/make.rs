@@ -25,7 +25,7 @@ use super::host::{GraphicsState, HostPipeline};
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
-    shaders: Vec<Arc<Shader>>,
+    pub(crate) shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queue_state: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
@@ -33,6 +33,9 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// The title frame in which a draw or dispatch first waited for it
+    /// (`u64::MAX`: none yet): only that frame waits ([`wait_once`]).
+    waited_frame: AtomicU64,
     /// Why it is not made, if it is not ([`left_out`]).
     left_out: Option<&'static str>,
     /// When a worker began it ([`slow`]).
@@ -112,6 +115,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            waited_frame: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -221,9 +225,46 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        let frame = crate::frame::current();
+        if !wait_once() || first_wait(p, frame) {
+            wait(p, frame);
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// Whether a pipeline that is not made is waited for in the first frame
+/// that asks for it only (on by default; `VICTORY_PIPELINE_WAIT_ONCE=0`
+/// waits in every frame, within the frame's budget, as before). A slow or
+/// queued-behind pipeline then costs one frame its wait, not every frame
+/// until it is made: pipeline waits went from 416-500 ms a frame to 0 on a
+/// world run (fxceless #867, powplusplus, via PalmVIDev #221).
+fn wait_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_ONCE").is_none_or(|v| v != "0"))
+}
+
+/// Whether `frame` is the first frame that waits for `p` (it is from now
+/// on, if none was).
+fn first_wait(p: &Pending, frame: u64) -> bool {
+    let first = match p.waited_frame.compare_exchange(u64::MAX, frame, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => frame,
+        Err(f) => f,
+    };
+    first == frame
+}
+
+/// Without waiting: `Some(true)` if `p` has a host pipeline, `Some(false)`
+/// if it was refused (or left out), `None` while it is being made (asked
+/// for now, ahead of everything no draw or dispatch asked for).
+pub(crate) fn poll(p: &Arc<Pending>) -> Option<bool> {
+    if p.left_out.is_some() {
+        return Some(false);
+    }
+    if p.made.get().is_none() {
+        start(p, REQUESTED);
+    }
+    p.made.get().map(Option::is_some)
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -465,16 +506,29 @@ fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        // `VICTORY_PIPELINE_WORKERS=<n>` overrides the count;
+        // `VICTORY_PIPELINE_NORMAL=1` runs them at normal priority, level
+        // with the title's threads (a title holding every core starves
+        // below-normal workers: about one pipeline per 2 s was seen).
+        let workers = std::env::var("VICTORY_PIPELINE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(1, 64))
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8)));
+        let normal = std::env::var_os("VICTORY_PIPELINE_NORMAL").is_some_and(|v| v == "1");
+        tracing::info!(workers, normal, "host pipeline workers");
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
-                    // Below the title's own threads (loading, recording).
+                .spawn(move || {
+                    // Below the title's own threads (loading, recording),
+                    // unless asked otherwise.
                     // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                    if !normal {
+                        unsafe {
+                            use windows::Win32::System::Threading::*;
+                            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        }
                     }
                     loop {
                         next().make();
@@ -605,5 +659,14 @@ mod tests {
         state.finish(0, third, ms(50), true, at(250));
         // 250 ms waited (0-250), whatever the per-thread sums.
         assert_eq!(state.reserve(0, ms(500), true, at(900)), ms(250));
+    }
+
+    #[test]
+    fn a_pipeline_is_waited_for_in_one_frame_only() {
+        let p = Pending::new(Vec::new(), None);
+        assert!(first_wait(&p, 7), "the first frame that asks waits");
+        assert!(first_wait(&p, 7), "and may wait again within that frame");
+        assert!(!first_wait(&p, 8), "a later frame does not wait");
+        assert!(!first_wait(&p, 6));
     }
 }

@@ -792,6 +792,9 @@ impl<'a> Lanes<'a> {
             .iter()
             .enumerate()
             .map(|(n, block)| {
+                // Reachability is fixed within the block. Vector instructions
+                // with the same EXEC therefore need the same guard.
+                let mut last_guard = None;
                 block
                     .insts
                     .iter()
@@ -801,8 +804,16 @@ impl<'a> Lanes<'a> {
                         | (_, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }) => {
                             None
                         }
-                        (&Some(e), _) if b.implies(cond[n], e) => None,
-                        (&Some(e), _) => Some(b.given(e, cond[n])),
+                        (&Some(e), _) => {
+                            if let Some((prev, guard)) = last_guard
+                                && prev == e
+                            {
+                                return guard;
+                            }
+                            let guard = (!b.implies(cond[n], e)).then(|| b.given(e, cond[n]));
+                            last_guard = Some((e, guard));
+                            guard
+                        }
                     })
                     .collect()
             })
@@ -837,9 +848,28 @@ impl<'a> Lanes<'a> {
             }
         }
         self.masks.retain(|k, _| !split.contains(&k.0));
-        self.active.retain(|lo| !split.contains(lo));
+        let masks: HashMap<Value, Bool> = self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect();
+        // A mask is only safe to ballot at its defining block when every lane
+        // whose bit can be set in `m` actually reaches that block (`m => cond[b]`).
+        // Masks written after EXEC was widened inside a divergent block (e.g.
+        // restoring a saved EXEC mask or a compare under widened EXEC) can hold
+        // bits for inactive lanes and must not stay in `active`.
+        self.active.retain(|lo| {
+            let Some(&m) = masks.get(lo) else {
+                return false;
+            };
+            let def_block = self
+                .defs
+                .get(lo)
+                .map(|&(b, _)| b)
+                .or_else(|| self.phis.get(lo).map(|&(b, _)| b));
+            match def_block {
+                None => true,
+                Some(block) => self.b.implies(m, cond[block]),
+            }
+        });
         Ok(Structured {
-            masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
+            masks,
             highs: self
                 .masks
                 .keys()
@@ -1277,10 +1307,11 @@ impl<'a> Lanes<'a> {
                     }
                 }
                 // `s_bcnt1` of a mask every running lane sees alike (EXEC under a scalar
-                // condition, or EXEC itself): its SCC, "some lane is set", is each lane's own
-                // bit. A branch on it then reads no ballot.
+                // condition, or EXEC itself): its SCC, "some lane is set", is `m` itself
+                // (`finish` simplifies `given(when, cond[b])` when EXEC matches block reach,
+                // while preserving narrowed EXEC for both exits and `scc_some`).
                 if takes_mask
-                    && name.starts_with("s_bcnt1_i32_b")
+                    && name.strip_prefix("s_bcnt1_i32_b") == Some(width)
                     && let Some(scc) = inst.write(Reg::Scc)
                     && let [a] = &src[..]
                     && let Some((m, true)) = self.operand(inst, a)
@@ -1290,7 +1321,7 @@ impl<'a> Lanes<'a> {
                     if self.b.implies(m, e)
                         && self.b.support(own).iter().all(|a| matches!(a, Atom::Uniform(_)))
                     {
-                        self.scc_lane.insert(scc, own);
+                        self.scc_lane.insert(scc, m);
                     }
                 }
             }
@@ -1619,6 +1650,37 @@ mod tests {
     }
 
     #[test]
+    fn guards_follow_exec_and_block_reachability() {
+        let p = build(
+            &[
+                0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0xBF88_0005, // s_cbranch_execz -> end
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0x7DA4_0880, // v_cmpx_eq_u32 exec, 0, v4
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0xBE82_0480, // s_mov_b64 s[2:3], 0
+                0x7E0A_0280, // v_mov_b32 v5, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let lane = |block: usize, i: usize| {
+            Atom::Lane(p.blocks[block].insts[i].write(Reg::S(EXEC)).unwrap())
+        };
+        let a = s.guards[0][1].unwrap();
+        let b = s.guards[1][2].unwrap();
+        assert_eq!(s.bools.node(a), Some((lane(0, 0), Bool::FALSE, Bool::TRUE)));
+        assert_eq!(s.guards[0], [None, Some(a), Some(a), None]);
+        // The fallthrough already implies the first compare. Only the second
+        // compare needs testing, and the scalar move never needs a guard.
+        assert_eq!(s.bools.node(b), Some((lane(1, 1), Bool::FALSE, Bool::TRUE)));
+        assert_eq!(s.guards[1], [None, None, Some(b), None, Some(b)]);
+    }
+
+    #[test]
     fn divergent_loop_exits_per_lane() {
         let p = build(
             &[
@@ -1925,6 +1987,141 @@ mod tests {
                 .iter()
                 .any(|&e| matches!(s.bools.support(e)[..], [Atom::Lane(_)])),
             "{edges:?}"
+        );
+    }
+
+    #[test]
+    fn widened_exec_inside_divergent_branch_is_not_active() {
+        // Block 0 narrows EXEC with v_cmp_eq_u32 + s_and_saveexec_b32 and
+        // branches over block 1 when EXEC is zero. Inside divergent block 1
+        // (cond[1] == vcc), EXEC is widened back to the saved full mask,
+        // copied to s4, and used for a VALU compare into s6. None of those
+        // block-1 masks imply cond[1], so none may stay in `active`.
+        let p = build(
+            &[
+                0xD4C2_0002,
+                0x0002_0080, // 0:  v_cmp_eq_u32 s2, 0, v0
+                0xBE80_3C02, // 8:  s_and_saveexec_b32 s0, s2
+                0xBF88_0004, // 12: s_cbranch_execz +4 (-> 32)
+                0xBEFE_0300, // 16: s_mov_b32 exec_lo, s0 (widens EXEC inside divergent block 1)
+                0xBE84_037E, // 20: s_mov_b32 s4, exec_lo
+                0xD4CA_0006,
+                0x0002_0280, // 24: v_cmp_ne_u32 s6, 0, v1 (under widened EXEC)
+                S_ENDPGM,    // 32: s_endpgm
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+
+        let s2_val = p.blocks[0].insts[0].write(Reg::S(2)).unwrap();
+        assert!(s.masks.contains_key(&s2_val));
+        assert!(s.active.contains(&s2_val), "block-0 compare is active");
+
+        let b1 = p.blocks.iter().find(|b| b.offset == 16).expect("block 1");
+        let restored_exec = b1.insts[0].write(Reg::S(EXEC)).unwrap();
+        let copied_s4 = b1.insts[1].write(Reg::S(4)).unwrap();
+        let cmp_s6 = b1.insts[2].write(Reg::S(6)).unwrap();
+
+        for (label, val) in [
+            ("restored exec", restored_exec),
+            ("copy of widened exec", copied_s4),
+            ("v_cmp under widened exec", cmp_s6),
+        ] {
+            assert!(s.masks.contains_key(&val), "{label} tracked in masks");
+            assert!(
+                !s.active.contains(&val),
+                "{label} must not be in active (its bits include lanes not executing block 1)"
+            );
+        }
+    }
+
+    #[test]
+    fn s_bcnt1_preserves_narrowed_exec_in_exits_and_scc_some() {
+        // Wave32: narrow EXEC inside block 0, count active lanes with s_bcnt1_i32_b32,
+        // restore EXEC, and branch on SCC == 0.
+        let p = build(
+            &[
+                0x7D84_0080, // 0: v_cmp_eq_u32 vcc, 0, v0
+                0xBE80_3C6A, // 4: s_and_saveexec_b32 s0, vcc_lo
+                0xBE81_0F7E, // 8: s_bcnt1_i32_b32 s1, exec_lo
+                0xBEFE_0300, // 12: s_mov_b32 exec_lo, s0
+                0xBF84_0001, // 16: s_cbranch_scc0 +1 -> 24
+                0x7E02_0280, // 20: v_mov_b32 v1, 0
+                S_ENDPGM,    // 24: s_endpgm
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let bcnt_scc = p.blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.name() == "s_bcnt1_i32_b32")
+            .and_then(|i| i.write(Reg::Scc))
+            .expect("s_bcnt1 writes SCC");
+        let &scc_bool = s.scc_some.get(&bcnt_scc).expect("s_bcnt1 tracked in scc_some");
+        assert_ne!(scc_bool, Bool::TRUE, "scc_some must not collapse narrowed EXEC to TRUE");
+        assert!(
+            matches!(s.bools.support(scc_bool)[..], [Atom::Lane(_)]),
+            "scc_some must preserve the narrowed lane predicate: {:?}",
+            s.bools.support(scc_bool)
+        );
+        let LaneExit::Branch { when, .. } = s.exits[0] else {
+            panic!("expected branch exit on block 0");
+        };
+        assert_ne!(when, Bool::FALSE, "s_cbranch_scc0 must not become dead (FALSE)");
+        assert!(
+            matches!(s.bools.support(when)[..], [Atom::Lane(_)]),
+            "branch condition must depend on narrowed EXEC lane predicate: {:?}",
+            s.bools.support(when)
+        );
+    }
+
+    #[test]
+    fn s_bcnt1_ignores_mismatched_wave_width() {
+        // Wave32 running s_bcnt1_i32_b64 (counts both s[2:3], wider than wave32).
+        let p32 = build(
+            &[
+                0xBE82_037E, // s_mov_b32 s2, exec_lo
+                0xBE83_0381, // s_mov_b32 s3, 1
+                0xBE81_1002, // s_bcnt1_i32_b64 s1, s[2:3]
+                0xBF84_0001, // s_cbranch_scc0 +1
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s32 = structure(&p32).unwrap();
+        let bcnt64_scc = p32.blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.name() == "s_bcnt1_i32_b64")
+            .and_then(|i| i.write(Reg::Scc))
+            .unwrap();
+        assert!(
+            !s32.scc_some.contains_key(&bcnt64_scc),
+            "wave32 must not treat s_bcnt1_i32_b64 as a wave32 lane-mask test"
+        );
+
+        // Wave64 running s_bcnt1_i32_b32 (counts only low 32 lanes of exec).
+        let p64 = build(
+            &[
+                0xBE81_0F7E, // s_bcnt1_i32_b32 s1, exec_lo
+                0xBF84_0001, // s_cbranch_scc0 +1
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s64 = structure(&p64).unwrap();
+        let bcnt32_scc = p64.blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.name() == "s_bcnt1_i32_b32")
+            .and_then(|i| i.write(Reg::Scc))
+            .unwrap();
+        assert!(
+            !s64.scc_some.contains_key(&bcnt32_scc),
+            "wave64 must not treat s_bcnt1_i32_b32 as a full wave64 lane-mask test"
         );
     }
 }

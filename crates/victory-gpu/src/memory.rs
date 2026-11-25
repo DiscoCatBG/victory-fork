@@ -52,15 +52,20 @@
 //! there are at most [`COPIES`] of them (windows of 1 to 4 MiB mostly).
 //! Every list with such a shader brings all numbered copies up to date
 //! and, if one of its shaders can store by address
-//! (`pipeline::Translated::stores_by_address`), declares all of them
-//! written (the bytes are compared on the CPU afterwards, as for any
-//! unordered access view): a dirty-page mask written by the shader would
-//! bound both.
+//! (`pipeline::Translated::stores_by_address`), declares written (the bytes
+//! are compared on the CPU afterwards, as for any unordered access view)
+//! only the copies shaders write (fxceless #346): stores and atomics set a
+//! mark per copy (`victory_shader::emit::MEMORY_MARKS`), read once a frame,
+//! and a list declares the copies marked in the last [`MARK_FRAMES`]
+//! frames, those its dispatches name and those numbered while it is
+//! recorded. Declaring every copy cost 3.9 GB of snapshots and compares a
+//! frame with the builder on (run 3 at 266cd04); `VICTORY_MEMORY_MARKS=0`
+//! does so again.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES};
+use victory_shader::emit::{MEMORY_FAULTS, MEMORY_MARKS, MEMORY_PAGES};
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::descriptor::host::HostHeap;
@@ -72,12 +77,18 @@ use crate::shadow::Shadow;
 /// of the opening cutscene names about 50 windows; with the structure
 /// builder on, 1,023 were all numbered two seconds after it started (run
 /// main-8918d34-builder, windows on the 1 MiB grid), and every page that
-/// found no number after that read zeros for the rest of the run.
-const COPIES: u32 = 4095;
+/// found no number after that read zeros for the rest of the run; 4,095
+/// were all numbered a minute in (run 3 at 266cd04: walls missing). 8,191
+/// as in fxceless #980.
+const COPIES: u32 = 8191;
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
 /// A directory page.
 const PAGE: u64 = 1 << 16;
+/// A copy counts as one shaders write for this many frames after a mark:
+/// marks are read once a frame, while lists recorded earlier still run.
+const MARK_FRAMES: u64 = 8;
+const _: () = assert!(COPIES < MEMORY_MARKS);
 
 struct Memory {
     /// Buffer, its mapping, its GPU address.
@@ -92,6 +103,9 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// Per copy: the frame its mark was last found set in (`u64::MAX`:
+    /// never), and the frame a list last declared it written in.
+    marked: Vec<(u64, u64)>,
     /// For [`empty`]: a directory without entries and the fault notes
     /// nothing reads, made at its first use.
     unbuilt: Option<[(ID3D12Resource, *mut u32, u64); 2]>,
@@ -128,11 +142,12 @@ impl Memory {
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
         Some(Memory {
             directory: zeroed(u64::from(MEMORY_PAGES) * 2, "directory")?,
-            faults: zeroed(u64::from(MEMORY_FAULTS), "faults")?,
+            faults: zeroed(u64::from(MEMORY_FAULTS + MEMORY_MARKS), "faults and marks")?,
             copies: Vec::new(),
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            marked: Vec::new(),
             unbuilt: None,
         })
     }
@@ -152,42 +167,40 @@ impl Memory {
     }
 
     /// Gives the page of `address` its copy, if it has none and the memory
-    /// is the title's.
-    fn map(&mut self, address: u64) {
+    /// is the title's. Returns the index in `copies` of the page's copy.
+    fn map(&mut self, address: u64) -> Option<usize> {
         let page = address / PAGE;
         // The last entry stays empty: addresses past the directory read it.
         if page >= u64::from(MEMORY_PAGES) - 1 {
-            return;
+            return None;
         }
         // SAFETY: inside the directory's mapping.
         let entry = unsafe { self.directory.1.add(page as usize * 2) };
         // SAFETY: as above.
-        if unsafe { entry.read() } != 0 {
-            return;
+        match unsafe { entry.read() } {
+            0 => {}
+            n => return Some(n as usize - 1),
         }
         let start = page * PAGE;
         // A shader's pointer, or a constant taken for an address, may be
         // anything: only memory the title has.
         if self.refused.contains(&page) {
-            return;
+            return None;
         }
         if !crate::texture::committed(start as *const u8, PAGE as usize) {
             self.refused.insert(page);
-            return;
+            return None;
         }
         // The copy a root view at that address would get; a buffer that
         // ends inside the page is passed over for what holds all of it.
         let whole = |s: &Arc<Shadow>| s.offset_in(start).is_some_and(|_| s.left(start) >= PAGE);
-        let Some(shadow) = crate::shadow::find(start, 1)
+        let shadow = crate::shadow::find(start, 1)
             .filter(whole)
-            .or_else(|| crate::shadow::find(start, PAGE).filter(whole))
-        else {
-            return;
-        };
+            .or_else(|| crate::shadow::find(start, PAGE).filter(whole))?;
         // SAFETY: a live buffer.
         let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
-            return;
+            return None;
         }
         let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
             Some(n) => n,
@@ -223,7 +236,7 @@ impl Memory {
                         "title memory by address: no number left for another copy; its pages read zeros"
                     )
                 });
-                return;
+                return None;
             }
         };
         let offset = shadow.offset_in(start).unwrap_or(0);
@@ -233,6 +246,7 @@ impl Memory {
             entry.add(1).write_volatile(offset as u32);
             entry.write_volatile(n as u32 + 1);
         }
+        Some(n)
     }
 
     /// The pages shaders found empty since the last frame.
@@ -266,11 +280,51 @@ impl Memory {
         }
     }
 
+    /// The marks set since they were last read (fxceless #346): their
+    /// copies are ones shaders write, as of `frame`.
+    fn take_marks(&mut self, frame: u64) {
+        self.marked.resize(self.copies.len(), (u64::MAX, u64::MAX));
+        // Marks of copies no list had declared written lately: stores that
+        // were not copied back.
+        let mut late = 0;
+        for n in 0..self.copies.len() {
+            // SAFETY: inside the mapping, past the fault notes; the GPU may
+            // be writing: a mark set after this read is found next frame.
+            let at = unsafe { self.faults.1.add(MEMORY_FAULTS as usize + n + 1) };
+            // SAFETY: as above.
+            if unsafe { at.read_volatile() } == 0 {
+                continue;
+            }
+            // SAFETY: as above.
+            unsafe { at.write_volatile(0) };
+            let (_, declared) = self.marked[n];
+            if declared == u64::MAX || frame.wrapping_sub(declared) > MARK_FRAMES {
+                late += 1;
+            }
+            self.marked[n].0 = frame;
+        }
+        if late != 0 {
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {
+                tracing::info!(
+                    copies = late,
+                    of = self.copies.len(),
+                    "title memory by address: shaders stored to copies no list had declared written (those stores were not copied back); they are declared from now on"
+                );
+            }
+        }
+    }
+
+    /// Whether copy `n` is one shaders wrote lately.
+    fn written_lately(&self, n: usize, frame: u64) -> bool {
+        self.marked.get(n).is_some_and(|&(marked, _)| marked != u64::MAX && frame.wrapping_sub(marked) <= MARK_FRAMES)
+    }
+
     /// What a dispatch names: the copy around `address` and the 4 MiB
-    /// after it.
-    fn name(&mut self, address: u64) {
-        self.map(address);
-        self.map((address & !(CELL - 1)) + CELL);
+    /// after it. Their indices go to `named`.
+    fn name(&mut self, address: u64, named: &mut Vec<usize>) {
+        named.extend(self.map(address));
+        named.extend(self.map((address & !(CELL - 1)) + CELL));
     }
 }
 
@@ -298,9 +352,12 @@ pub(crate) fn ready(
         m.frame = frame;
         m.refused.clear();
         m.take_faults();
+        m.take_marks(frame);
     }
+    let numbered = m.copies.len();
+    let mut named = Vec::new();
     for &address in addresses {
-        m.name(address);
+        m.name(address, &mut named);
     }
     // A title address in two constants (low dword, then bits 32 to 39), or
     // in one in 256-byte units. A constant that only looks like one names
@@ -310,10 +367,10 @@ pub(crate) fn ready(
             && (1..=0xFF).contains(&high)
             && c >= 0x1_0000
         {
-            m.name(u64::from(c) | u64::from(high) << 32);
+            m.name(u64::from(c) | u64::from(high) << 32, &mut named);
         }
         if c >= 0x0100_0000 {
-            m.name(u64::from(c) << 8);
+            m.name(u64::from(c) << 8, &mut named);
         }
     }
     let key = std::ptr::from_ref(heap) as usize;
@@ -333,13 +390,33 @@ pub(crate) fn ready(
         shadow.refresh(list, start, len);
     }
     if writes {
-        for shadow in &m.copies[write_from..] {
+        // Written (fxceless #346): of the copies this list has not looked
+        // at yet, those shaders marked lately and those numbered now; and
+        // the copies this dispatch names. Each once per list.
+        // shortcut: a copy this list passed over that shaders mark later
+        // in the frame is not declared by this list; its stores there are
+        // not copied back (the log counts such marks).
+        const WRITTEN: usize = usize::MAX - 0x1000;
+        let all = !marks();
+        m.marked.resize(m.copies.len(), (u64::MAX, u64::MAX));
+        let fresh = write_from..m.copies.len();
+        let wanted: Vec<usize> = fresh
+            .clone()
+            .filter(|&n| all || n >= numbered || m.written_lately(n, frame))
+            .chain(named.iter().copied().filter(|n| !fresh.contains(n)))
+            .collect();
+        for n in wanted {
+            if !list.first_use(WRITTEN - n) {
+                continue;
+            }
+            let shadow = &m.copies[n];
             let (start, len) = shadow.span();
             // Bounded for the structure builder (`crate::pipeline::bvh_bound`).
             // shortcut: a list's copies are declared once, by whichever
             // program that can store comes first; a list mixing the builder
             // with another such program follows the first.
             crate::pipeline::builder_writes(list, shadow, start, len, builder);
+            m.marked[n].1 = frame;
         }
     }
     if list.first_use(KEEP) {
@@ -351,6 +428,15 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
     })
+}
+
+/// Whether only the copies shaders mark are taken for written (on by
+/// default; `VICTORY_MEMORY_MARKS=0` takes every copy, as before: each
+/// list then snapshots and compares all of them, 3.9 GB a frame with the
+/// structure builder on).
+fn marks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_MARKS").is_none_or(|v| v != "0"))
 }
 
 /// Evicts cached descriptor-run state for `heap` when its owning `Heap` is
@@ -391,7 +477,7 @@ pub(crate) fn empty(list: &HostList, heap: &HostHeap) -> Option<Ready> {
     if m.unbuilt.is_none() {
         m.unbuilt = Some([
             zeroed(u64::from(MEMORY_PAGES) * 2, "directory of unbuilt structures")?,
-            zeroed(u64::from(MEMORY_FAULTS), "faults of unbuilt structures")?,
+            zeroed(u64::from(MEMORY_FAULTS + MEMORY_MARKS), "faults of unbuilt structures")?,
         ]);
     }
     let [directory, faults] = m.unbuilt.as_ref()?;
