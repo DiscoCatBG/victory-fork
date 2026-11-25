@@ -9,10 +9,14 @@
 //! the title checks it one block later and treats a late command as an
 //! overrun. Commands complete when submitted here.
 //!
-//! Convolution runs on the host with the console's partitioned
-//! frequency-domain impulse responses (see [`super::dsp_convolve`]), so
-//! reverb returns are wet. The FFT and IFFT stream transforms remain silent:
-//! their inputs and outputs are spectra, not audio a title can play.
+//! Convolution can run on the host with the console's partitioned
+//! frequency-domain impulse responses (see [`super::dsp_convolve`]), but
+//! only with `VICTORY_DSP_CONVOLVE=1`: our reading of the impulse response
+//! layout is not right yet, and in Grand Theft Auto VI the wet returns pin
+//! the whole mix near full scale from the moment the world loads (a steady
+//! buzz, no game audio). By default reverb returns are silence (dry). The
+//! FFT and IFFT stream transforms remain silent: their inputs and outputs
+//! are spectra, not audio a title can play.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -28,6 +32,16 @@ const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 
 const CONVOLUTION: u32 = 1;
+
+/// Whether convolution streams are computed (`VICTORY_DSP_CONVOLVE=1`);
+/// otherwise their outputs are silence. Always on in unit tests.
+fn convolve() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DSP_CONVOLVE").as_deref() == Ok("1"))
+}
 /// XDspActivationOptions: a per-channel IR and deinterleaved blocks both
 /// need a stereo stream; polar format is for FFT/IFFT only.
 const DEINTERLEAVED: u32 = 2;
@@ -175,7 +189,7 @@ pub extern "system" fn XDspActivate(
     }
     // SAFETY: `valid` checked the pointer and length; the IR stays alive in
     // title memory for the stream's lifetime (the console copies it here).
-    let convolver = if kind == CONVOLUTION {
+    let convolver = if kind == CONVOLUTION && convolve() {
         let ir = unsafe { std::slice::from_raw_parts(desc.ir, desc.ir_floats as usize) };
         match Convolver::new(
             ir,
@@ -223,8 +237,9 @@ pub extern "system" fn XDspDeactivate(stream: *mut Stream) -> HRESULT {
     S_OK
 }
 
-/// Completes the command at once. Convolution writes wet output; the FFT
-/// and IFFT transforms still return silence.
+/// Completes the command at once. Convolution writes wet output when
+/// enabled (see [`convolve`]); otherwise, and for the FFT and IFFT
+/// transforms, the output is silence.
 pub extern "system" fn XDspSubmitCommand(
     stream: *mut Stream,
     command: *const Command,
