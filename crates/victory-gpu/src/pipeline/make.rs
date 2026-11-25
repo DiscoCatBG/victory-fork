@@ -33,6 +33,9 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// The title frame in which a draw or dispatch first waited for it
+    /// (`u64::MAX`: none yet): only that frame waits ([`wait_once`]).
+    waited_frame: AtomicU64,
     /// Why it is not made, if it is not ([`left_out`]).
     left_out: Option<&'static str>,
     /// When a worker began it ([`slow`]).
@@ -112,6 +115,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            waited_frame: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -221,9 +225,33 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        let frame = crate::frame::current();
+        if !wait_once() || first_wait(p, frame) {
+            wait(p, frame);
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// Whether a pipeline that is not made is waited for in the first frame
+/// that asks for it only (on by default; `VICTORY_PIPELINE_WAIT_ONCE=0`
+/// waits in every frame, within the frame's budget, as before). A slow or
+/// queued-behind pipeline then costs one frame its wait, not every frame
+/// until it is made: pipeline waits went from 416-500 ms a frame to 0 on a
+/// world run (fxceless #867, powplusplus, via PalmVIDev #221).
+fn wait_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_ONCE").is_none_or(|v| v != "0"))
+}
+
+/// Whether `frame` is the first frame that waits for `p` (it is from now
+/// on, if none was).
+fn first_wait(p: &Pending, frame: u64) -> bool {
+    let first = match p.waited_frame.compare_exchange(u64::MAX, frame, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => frame,
+        Err(f) => f,
+    };
+    first == frame
 }
 
 /// Without waiting: `Some(true)` if `p` has a host pipeline, `Some(false)`
@@ -630,5 +658,14 @@ mod tests {
         state.finish(0, third, ms(50), true, at(250));
         // 250 ms waited (0-250), whatever the per-thread sums.
         assert_eq!(state.reserve(0, ms(500), true, at(900)), ms(250));
+    }
+
+    #[test]
+    fn a_pipeline_is_waited_for_in_one_frame_only() {
+        let p = Pending::new(Vec::new(), None);
+        assert!(first_wait(&p, 7), "the first frame that asks waits");
+        assert!(first_wait(&p, 7), "and may wait again within that frame");
+        assert!(!first_wait(&p, 8), "a later frame does not wait");
+        assert!(!first_wait(&p, 6));
     }
 }

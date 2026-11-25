@@ -3721,10 +3721,17 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+/// A reader-writer lock: [`lookup`] finds a buffer whose copy is made
+/// under a shared lock, and the recording threads do so at every draw
+/// (PalmVIDev #221 from fxceless #867, powplusplus).
+static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> = std::sync::RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
+}
+
+fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.read().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Of title memory `[from, to)`: the parts that title buffer objects hold,
@@ -3861,6 +3868,21 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
+    let enclosing = |map: &BTreeMap<(u64, usize), Entry>| {
+        map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end).map(|(k, _)| *k)
+    };
+    // Under the shared lock first: a buffer whose copy is made is what
+    // most asks find.
+    {
+        let map = buffers_read();
+        let Some(key) = enclosing(&map) else {
+            drop(map);
+            return loose(address, end, len <= 1, any);
+        };
+        if let Some(shadow) = map.get(&key).and_then(|e| e.shadow.as_ref()) {
+            return Some(shadow.clone());
+        }
+    }
     let mut map = buffers();
     let key = map
         .range(..=(address, usize::MAX))
