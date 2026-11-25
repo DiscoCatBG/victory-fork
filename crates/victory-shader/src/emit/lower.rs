@@ -6635,7 +6635,14 @@ impl<'a> Lower<'a> {
                     .iter()
                     .find(|u| u.user_data == rp.user_data)
                     .map(|u| u.kind);
-                match (rp.root, kind, props.0) {
+                // A root view has one handle for all its accesses
+                // (`root_uav_handle`), annotated without the globally
+                // coherent bit: an access marked `glc` takes that handle
+                // as an unmarked one does. (With the bit left in, a `glc`
+                // store through a root UAV matched nothing below and the
+                // program did not translate: four of the ray-tracing
+                // structure builder's, whose stages run all or none.)
+                match (rp.root, kind, props.0 & !GLOBALLY_COHERENT_PROP) {
                     (RootType::Descriptor, Some(ResourceType::Cbv) | None, 13) => {
                         Ok(self.s.root_cbv_handle(rp.slot))
                     }
