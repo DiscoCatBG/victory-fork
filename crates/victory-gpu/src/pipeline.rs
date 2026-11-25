@@ -141,6 +141,9 @@ pub(crate) struct Translated {
     pub(crate) stores: bool,
     /// Whether the shader walks ray-tracing structures ([`walks`]).
     pub(crate) walks: bool,
+    /// Whether the shader's code can store to title memory by raw address
+    /// ([`stores_by_address`]); true when its code is not known.
+    pub(crate) stores_by_address: bool,
 }
 
 #[cfg(windows)]
@@ -251,6 +254,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let walks = programs.iter().any(walks);
+    let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -261,7 +265,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores, walks })
+    Ok(Translated { host, used, stores, walks, stores_by_address })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -529,6 +533,33 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
             | Encoding::Smem
             | Encoding::Flat
             | Encoding::Global => name.is_none_or(|n| {
+                (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+            }),
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
+    })
+}
+
+/// Whether a console program can store to title memory by raw address: it
+/// has a flat or global store or atomic (`victory_shader::emit`
+/// `SLOT_MEMORY`: the only accesses translated as reads and writes by
+/// address; scalar memory there only loads), or code that is not all known
+/// (as [`stores`]). The programs that walk the ray-tracing structures read
+/// them by address and store their results through views: with
+/// [`stores`] alone each of their dispatches declared every numbered copy
+/// written (run main-8918d34-builder: 6,752 MB of windows snapshotted and
+/// compared on the CPU a frame, for nothing written).
+#[cfg(windows)]
+fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Flat | Encoding::Global => name.is_none_or(|n| {
                 (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
             }),
             Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),

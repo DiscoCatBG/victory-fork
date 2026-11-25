@@ -49,11 +49,13 @@
 //! `VICTORY_RT_WALK_UNBUILT=1` has them read title memory as before.
 //!
 //! shortcut: a copy that is numbered is kept for the rest of the run, and
-//! there are at most [`COPIES`] of them (4 MiB windows mostly: 4 GiB at
-//! most). Every dispatch of such a shader brings all numbered copies up to
-//! date and, if it can store, declares all of them written (the bytes are
-//! compared on the CPU afterwards, as for any unordered access view): a
-//! dirty-page mask written by the shader would bound both.
+//! there are at most [`COPIES`] of them (windows of 1 to 4 MiB mostly).
+//! Every list with such a shader brings all numbered copies up to date
+//! and, if one of its shaders can store by address
+//! (`pipeline::Translated::stores_by_address`), declares all of them
+//! written (the bytes are compared on the CPU afterwards, as for any
+//! unordered access view): a dirty-page mask written by the shader would
+//! bound both.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -65,9 +67,13 @@ use crate::descriptor::host::HostHeap;
 use crate::host::{HostList, host};
 use crate::shadow::Shadow;
 
-/// Copies that can be numbered (the run of heap slots is one longer). A
-/// listed frame of the opening cutscene names about 50 windows.
-const COPIES: u32 = 1023;
+/// Copies that can be numbered (the run of heap slots is one longer, taken
+/// from each view heap's dynamic slots for the heap's life). A listed frame
+/// of the opening cutscene names about 50 windows; with the structure
+/// builder on, 1,023 were all numbered two seconds after it started (run
+/// main-8918d34-builder, windows on the 1 MiB grid), and every page that
+/// found no number after that read zeros for the rest of the run.
+const COPIES: u32 = 4095;
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
 /// A directory page.
@@ -211,7 +217,11 @@ impl Memory {
             None => {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
-                    tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
+                    tracing::warn!(
+                        COPIES,
+                        address = format_args!("{start:#x}"),
+                        "title memory by address: no number left for another copy; its pages read zeros"
+                    )
                 });
                 return;
             }

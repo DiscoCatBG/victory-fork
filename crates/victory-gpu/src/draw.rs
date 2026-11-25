@@ -1145,7 +1145,9 @@ impl State {
                 } else {
                     #[cfg(feature = "diagnostics")]
                     let _phase = BindPhase::start(BIND_MEMORY);
-                    self.memory_ready(list, compute, writes)
+                    // Declared written only by a shader that stores by
+                    // address: a walker stores its results through views.
+                    self.memory_ready(list, compute, writes && t.stores_by_address)
                 };
                 let Some(ready) = ready else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
