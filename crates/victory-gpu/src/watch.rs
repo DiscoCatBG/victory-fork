@@ -822,6 +822,21 @@ pub(crate) fn guard_work() -> [u64; 8] {
     std::array::from_fn(|i| GUARD_WORK[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
+/// Who opens blocks now, set under the guards' lock: 0 a write of the
+/// title's that faulted, 1 a write of ours or the runtime's told ahead
+/// ([`writing`]), 2 a view mapped ([`views_mapped`]); and the blocks opened
+/// for each since the last frame line.
+#[cfg(feature = "diagnostics")]
+static OPENER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "diagnostics")]
+static OPENED_BY: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// [`OPENED_BY`], and zeroes it.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn opened_by() -> [u64; 3] {
+    std::array::from_fn(|i| OPENED_BY[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
 /// The frame each block was last opened in, for [`GUARD_WORK`].
 #[cfg(feature = "diagnostics")]
 static OPENED_IN: Mutex<std::collections::BTreeMap<usize, u64>> = Mutex::new(std::collections::BTreeMap::new());
@@ -975,6 +990,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         #[cfg(feature = "diagnostics")]
         {
             guard_worked(4, started);
+            OPENED_BY[OPENER.load(std::sync::atomic::Ordering::Relaxed).min(2)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let frame = crate::frame::current();
             let before = OPENED_IN.lock().unwrap_or_else(|e| e.into_inner()).insert(block, frame);
             if before.is_some_and(|b| frame.saturating_sub(b) <= 1) {
@@ -991,7 +1007,12 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
-    open(&mut guards(), at, at.saturating_add(len));
+    {
+        let mut g = guards();
+        #[cfg(feature = "diagnostics")]
+        OPENER.store(1, std::sync::atomic::Ordering::Relaxed);
+        open(&mut g, at, at.saturating_add(len));
+    }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
 }
@@ -1064,6 +1085,8 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
         return;
     }
     let mut g = guards();
+    #[cfg(feature = "diagnostics")]
+    OPENER.store(2, std::sync::atomic::Ordering::Relaxed);
     for &(at, n) in &ranges {
         if open_here(&mut g, at, at.saturating_add(n)) {
             #[cfg(feature = "diagnostics")]
@@ -1327,6 +1350,8 @@ fn install() {
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
+        #[cfg(feature = "diagnostics")]
+        OPENER.store(0, std::sync::atomic::Ordering::Relaxed);
         if open(&mut g, at, at + 1) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
