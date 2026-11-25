@@ -615,6 +615,25 @@ macro_rules! once {
     }};
 }
 
+/// The most thread groups the host runs in one dimension of a dispatch.
+const PART: u32 = 65_535;
+/// Parts a direct dispatch may be split into (`group_base`).
+const SPLIT_MOST: u32 = 16;
+/// Direct dispatches run in parts so far.
+pub(crate) static SPLIT_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Where a compute pipeline's program takes the number of its first thread
+/// group (`victory_shader::emit::USER_GROUP_BASE`): the root parameter of
+/// its user data and the dword in it. Ported from e9a5fb6 (myokex/victory-amd
+/// 4436f8f, 892d259): the console runs any number of groups in x.
+fn group_base(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
+    let stage = p.stages.first().filter(|_| p.compute)?;
+    let (param, _) = stage.user_data?;
+    let base = RootType::Other(victory_shader::emit::USER_GROUP_BASE);
+    let word = stage.translated().host.user_data.iter().find(|u| u.root == base)?;
+    Some((param, word.index))
+}
+
 /// Bounds a direct dispatch to the limits also enforced for indirect ones.
 fn direct_dispatch_allowed(x: u32, y: u32, z: u32) -> bool {
     const MAX_GROUPS_PER_DIMENSION: u32 = 65_535;
@@ -928,7 +947,11 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        // Set between the parts of a large dispatch (`group_base`).
+        if kind == USER_GROUP_BASE {
+            return 0;
+        }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
@@ -2547,7 +2570,11 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !direct_dispatch_allowed(x, y, z) {
+        // More groups in x than the host runs in one dispatch: in parts, if
+        // the program takes the number of its first group (`group_base`).
+        let split = group_base(p).filter(|_| x > PART);
+        let x_checked = if split.is_some() { x.min(PART) } else { x };
+        if !direct_dispatch_allowed(x_checked, y, z) || (split.is_some() && x > PART * SPLIT_MOST) {
             once!(
                 groups = format_args!("{x}x{y}x{z}"),
                 "a direct compute dispatch exceeds host work limits and is dropped"
@@ -2576,8 +2603,24 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        match split {
+            Some((param, dword)) => {
+                // SAFETY: an open list with everything set; the parameter
+                // and dword are the pipeline's.
+                unsafe {
+                    let mut base = 0;
+                    while base < x {
+                        list.list.SetComputeRoot32BitConstant(param, base, dword);
+                        list.list.Dispatch((x - base).min(PART), y, z);
+                        base += PART;
+                    }
+                    list.list.SetComputeRoot32BitConstant(param, 0, dword);
+                }
+                SPLIT_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+            }
+            // SAFETY: an open list with everything set.
+            None => unsafe { list.list.Dispatch(x, y, z) },
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
