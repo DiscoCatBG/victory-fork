@@ -80,6 +80,17 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         .filter(|r| r.0 < r.1)
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
+    // View memory the guards hold is left to `writes`, which answers it
+    // from the guards: asked here, a run of it failed in the kernel, was
+    // asked again by halves down to single ranges, failing each time, and
+    // then failed once more in `writes`.
+    if !view_ask() {
+        let g = guards();
+        pieces.retain(|&(first, _)| {
+            let block = first * PAGE / BLOCK;
+            !(g.protected.contains(block) || g.absent.contains(block))
+        });
+    }
     if pieces.len() < 2 {
         return;
     }
@@ -273,6 +284,8 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         )
     } != 0;
     if failed {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::WatchFailed, 1);
         return false;
     }
     #[cfg(feature = "diagnostics")]
@@ -330,17 +343,26 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    // View memory the guards already hold cannot be write-watched: the
+    // kernel asking would only fail before the guards answer, and copies of
+    // it are flushed thousands of times a frame (fxceless/victory-fork#670).
+    let known = guarded && known_view(first * PAGE);
     // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
+    let failed = known
+        || unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
+    #[cfg(feature = "diagnostics")]
+    if failed {
+        crate::copystat::add(if known { crate::copystat::C::WatchKnownView } else { crate::copystat::C::WatchFailed }, 1);
+    }
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -379,6 +401,27 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
+
+/// Whether `VICTORY_VIEW_ASK=1` (or `VICTORY_GUARD_ASK=1`): the kernel's
+/// write watch is asked about view memory too, as before, though it can
+/// only fail there.
+fn view_ask() -> bool {
+    static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ASK.get_or_init(|| ["VICTORY_VIEW_ASK", "VICTORY_GUARD_ASK"].iter().any(|n| std::env::var_os(n).is_some_and(|v| v == "1")))
+}
+
+/// Whether the block holding `start` is view memory the guards already
+/// hold (read-only by our hand, or noted absent): asking the kernel's write
+/// watch about it can only fail. The guards take a range the same way, by
+/// its first block ([`guard`]).
+fn known_view(start: usize) -> bool {
+    if view_ask() {
+        return false;
+    }
+    let g = guards();
+    let first = start / BLOCK;
+    g.protected.contains(first) || g.absent.contains(first)
+}
 
 /// Words of block bits per chunk of [`Blocks`]: a chunk holds 16,384
 /// blocks, 1 GiB of addresses.

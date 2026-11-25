@@ -127,8 +127,14 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Kernel write-watch askings that failed (memory not write-watched,
+    /// or a run across two reservations), and askings not made because the
+    /// guards hold the memory as view memory (`watch::known_view`).
+    WatchFailed,
+    WatchKnownView,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 82;
+const _: () = assert!((C::WatchKnownView as usize) < COUNTERS);
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1262,6 +1268,11 @@ pub(crate) fn log(frames: f64) {
             longest as f64 / 1e3
         );
     }
+    tracing::info!(
+        "  write-watch askings per frame: {:.0} failed in the kernel, {:.0} not made for memory the guards hold as views",
+        c[C::WatchFailed as usize],
+        c[C::WatchKnownView as usize]
+    );
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
