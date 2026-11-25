@@ -536,6 +536,12 @@ pub(crate) fn is_texture_view(view: &View) -> bool {
 /// ([`buffer_view_ok`]), since the start.
 pub(crate) static REFUSED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Buffer views left null for where they lie in their host copy, since the
+/// start (each is warned of once only): shader views not on an element of
+/// the copy, unordered access views not on one, constant buffer views not
+/// 256-byte aligned there. Shaders read zeros through them.
+pub(crate) static MISPLACED_VIEWS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// Whether the host device is gone, and why (the first time it is asked
 /// after that): for passes that make many views, to name the one that did
 /// it.
@@ -1944,6 +1950,7 @@ fn buffer_srv(
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     if window.is_none() {
         if element == 0 || offset % element != 0 {
+            MISPLACED_VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             once!(
                 offset,
                 element,
@@ -2022,6 +2029,7 @@ fn buffer_uav(
         buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     } else {
         if element == 0 || offset % element != 0 {
+            MISPLACED_VIEWS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             once!(offset, element, "unordered buffer view not on an element of its host copy");
             return None;
         }
@@ -2246,6 +2254,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
+                MISPLACED_VIEWS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 once!(
                     address = format_args!("{address:#x}"),
                     "constant buffer not 256-byte aligned on the host"
