@@ -1033,7 +1033,19 @@ impl State {
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                // The structure builder off: what its structures' walkers
+                // would read is not a structure (`memory::empty`).
+                let unbuilt = t.walks && !crate::pipeline::builder_live() && !crate::memory::walks_unbuilt();
+                let ready = if unbuilt {
+                    let heap = match self.heaps[0] {
+                        0 => None,
+                        h => crate::descriptor::heap(h as This).host(),
+                    };
+                    heap.and_then(|heap| crate::memory::empty(list, heap))
+                } else {
+                    self.memory_ready(list, compute, writes)
+                };
+                let Some(ready) = ready else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };

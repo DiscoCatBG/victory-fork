@@ -139,6 +139,8 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether the shader walks ray-tracing structures ([`walks`]).
+    pub(crate) walks: bool,
 }
 
 #[cfg(windows)]
@@ -248,6 +250,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let walks = programs.iter().any(walks);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -258,7 +261,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated { host, used, stores, walks })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -404,12 +407,58 @@ pub(crate) fn is_builder(this: This) -> bool {
     !this.is_null() && pipeline(this).builder
 }
 
+/// Set while the builder's stages run: from the first dispatch that found
+/// every builder pipeline made, until one is dropped.
+#[cfg(windows)]
+static BUILDER_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the structure builder runs, so that the structures in title
+/// memory are ones it built. While it does not, the programs that walk
+/// them are given empty ones (`memory::empty`): what lies at a structure's
+/// address is then not a structure.
+#[cfg(windows)]
+pub(crate) fn builder_live() -> bool {
+    BUILDER_LIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Says, at the builder's first dropped dispatches while it is not asked
+/// for, how many of its pipelines the title has created and how many of
+/// them the host has: what `VICTORY_BVH_BUILDER=1` would find
+/// (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn builder_census() {
+    static DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    // The first is too early for the workers; the later ones say how it ended.
+    if !matches!(n, 1 | 4_096 | 65_536) {
+        return;
+    }
+    let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut made, mut making, mut refused) = (0, 0, 0);
+    for p in &b.pipelines {
+        match make::missing(p) {
+            None => made += 1,
+            Some(why) if why.ends_with("being made") => making += 1,
+            Some(_) => refused += 1,
+        }
+    }
+    tracing::info!(
+        dropped_so_far = n,
+        created = b.pipelines.len(),
+        made,
+        making,
+        refused,
+        "the ray-tracing structure builder is off (VICTORY_BVH_BUILDER=1 asks for it): its pipelines the title has created, by whether the host has them; it runs only with none refused"
+    );
+}
+
 /// A stage of the builder was dropped after all: none runs from here on.
 #[cfg(windows)]
 pub(crate) fn builder_off(why: &'static str) {
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
     if !b.off {
         b.off = true;
+        BUILDER_LIVE.store(false, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(why, "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none");
     }
 }
@@ -420,6 +469,8 @@ pub(crate) fn builder_off(why: &'static str) {
 pub(crate) fn builder_runs() -> bool {
     static ALLOWED: OnceLock<bool> = OnceLock::new();
     if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+        #[cfg(feature = "diagnostics")]
+        builder_census();
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -432,6 +483,7 @@ pub(crate) fn builder_runs() -> bool {
     let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
     if missing > 0 {
         b.off = true;
+        BUILDER_LIVE.store(false, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(
             missing,
             of = b.pipelines.len(),
@@ -444,7 +496,16 @@ pub(crate) fn builder_runs() -> bool {
         "the ray-tracing structure builder runs: all of its programs have host pipelines"
     );
     b.whole = true;
+    BUILDER_LIVE.store(true, std::sync::atomic::Ordering::Relaxed);
     true
+}
+
+/// Whether a console program walks ray-tracing structures: it has one of
+/// the two instructions that test a ray against a node of one.
+#[cfg(windows)]
+fn walks(program: &victory_shader::NativeProgram) -> bool {
+    victory_shader::gfx10::decode(&program.code)
+        .is_ok_and(|code| code.iter().any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh"))))
 }
 
 /// Whether a console program can store to buffer memory: it has a buffer,
