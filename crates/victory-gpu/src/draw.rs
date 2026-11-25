@@ -474,7 +474,7 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "diagnostics")]
 pub(crate) static BIND_TIMES: [AtomicU64; 2 * BIND_PHASES] = [const { AtomicU64::new(0) }; 2 * BIND_PHASES];
 #[cfg(feature = "diagnostics")]
-pub(crate) const BIND_PHASES: usize = 9;
+pub(crate) const BIND_PHASES: usize = 12;
 #[cfg(feature = "diagnostics")]
 const BIND_ALL: usize = 0;
 #[cfg(feature = "diagnostics")]
@@ -498,6 +498,16 @@ const BIND_BUFFERS: usize = 6;
 const BIND_TEXTURES: usize = 7;
 #[cfg(feature = "diagnostics")]
 const BIND_FRESH: usize = 8;
+// The pass over textures picked by index (`State::heap_textures`): its
+// 300-1,100 ms frames (main ce79bfb, 20 of 77 seconds) as a slot's view
+// made on the host (with its host texture), its staging, and the looks
+// that find an uploaded texture unchanged.
+#[cfg(feature = "diagnostics")]
+const BIND_PASS_MIRROR: usize = 9;
+#[cfg(feature = "diagnostics")]
+const BIND_PASS_STAGE: usize = 10;
+#[cfg(feature = "diagnostics")]
+const BIND_PASS_LOOK: usize = 11;
 /// The names of [`BIND_TIMES`]' parts, in order.
 #[cfg(feature = "diagnostics")]
 pub(crate) const BIND_NAMES: [&str; BIND_PHASES] = [
@@ -510,6 +520,9 @@ pub(crate) const BIND_NAMES: [&str; BIND_PHASES] = [
     "buffer views refreshed (in tables and out)",
     "texture views readied (in tables and out)",
     "(tables) tables made afresh",
+    "(texture pass) views made",
+    "(texture pass) textures staged",
+    "(texture pass) uploaded textures looked at again",
 ];
 
 /// One part of a bind, timed until dropped.
@@ -2094,7 +2107,12 @@ impl State {
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
             if let Some(((at, len, print, looks, uploaded), mips)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len, mips.as_deref().unwrap_or_default()) == print {
+                #[cfg(feature = "diagnostics")]
+                let phase = BindPhase::start(BIND_PASS_LOOK);
+                let same = crate::texture::fingerprint(at, len, mips.as_deref().unwrap_or_default()) == print;
+                #[cfg(feature = "diagnostics")]
+                drop(phase);
+                if same {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
@@ -2184,7 +2202,11 @@ impl State {
                     );
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            let phase = BindPhase::start(BIND_PASS_MIRROR);
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+            #[cfg(feature = "diagnostics")]
+            drop(phase);
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
@@ -2204,6 +2226,8 @@ impl State {
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
             if let Some(view) = &view {
+                #[cfg(feature = "diagnostics")]
+                let _phase = BindPhase::start(BIND_PASS_STAGE);
                 readable(list, sampled.kind, view);
             }
             // A texture view the host refuses removes the device: name it.
