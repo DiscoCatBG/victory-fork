@@ -1332,11 +1332,6 @@ void work() {
         heap_pairs: [[Option<ID3D12DescriptorHeap>; 2]; 2],
         tables: [D3D12_GPU_DESCRIPTOR_HANDLE; 2],
         targets: [D3D12_CPU_DESCRIPTOR_HANDLE; 2],
-<<<<<<< Updated upstream
-        #[allow(dead_code, reason = "the bench uses the handle through a local of the same name")]
-        depth_written: D3D12_CPU_DESCRIPTOR_HANDLE,
-=======
->>>>>>> Stashed changes
         depth_tested: D3D12_CPU_DESCRIPTOR_HANDLE,
         stamps: ID3D12QueryHeap,
         back: ID3D12Resource,
