@@ -1811,6 +1811,35 @@ pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
+/// Whether a merge writes back only the runs of bytes the card changed, not
+/// the whole stretch from the first to the last of them (fxceless #786): a
+/// byte the title writes in a gap between the read and the write back then
+/// keeps the title's value. `VICTORY_MERGE_RUNS=0` writes the stretch.
+fn merge_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_MERGE_RUNS").map_or(true, |v| v != "0"))
+}
+
+/// The runs the card changed in a stretch about to be merged (`now` against
+/// the reference), or `None` where the whole stretch is written.
+fn card_runs(now: &[u8], held: &[u8]) -> Option<Vec<(usize, usize)>> {
+    merge_runs().then(|| changed_runs(now, held))
+}
+
+/// Writes the merged stretch `title` back at title address `at`: its `runs`
+/// alone, or all of it without them.
+fn put_runs(at: usize, title: &[u8], runs: Option<&[(usize, usize)]>) {
+    let write = crate::host::TitleWrite::open(at, title.len());
+    match runs {
+        Some(runs) => {
+            for &(r, m) in runs {
+                write.put(at + r, title[r..].as_ptr(), m);
+            }
+        }
+        None => write.put(at, title.as_ptr(), title.len()),
+    }
+}
+
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
@@ -2875,10 +2904,12 @@ impl Shadow {
         if !crate::host::read_into((start + at) as *const u8, title) {
             return 0;
         }
+        // The card's bytes, found before the merge takes them into `held`.
+        let runs = card_runs(now, held);
         if !merge_piece(now, held, title) {
             return 0;
         }
-        crate::host::TitleWrite::open(start + at, n).put(start + at, title.as_ptr(), n);
+        put_runs(start + at, title, runs.as_deref());
         n
     }
 
@@ -3549,10 +3580,11 @@ impl Shadow {
         let mut written = 0;
         let mut upload = false;
         if crate::host::read_into((start + at) as *const u8, title) {
+            let runs = card_runs(gpu, old);
             let (write_title, write_card) = merged_destinations(old, gpu, title);
             upload = write_card;
             if write_title {
-                crate::host::TitleWrite::open(start + at, n).put(start + at, title.as_ptr(), n);
+                put_runs(start + at, title, runs.as_deref());
                 written = n;
             }
         } else {
