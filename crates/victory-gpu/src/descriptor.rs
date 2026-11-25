@@ -671,7 +671,19 @@ pub(crate) fn make_waiting() {
             // texture without a host copy must go on waiting).
             // (Looked up first: the handle is read only while its heap is
             // there.)
-            let Some((heap, index)) = shader_slot(handle) else {
+            // `SHADER_HEAPS` stays locked so `Heap::drop` cannot free the
+            // heap while it is used here (as in `mirror`).
+            let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(&(_, _, at)) = heaps
+                .iter()
+                .find(|&&(start, end, _)| (start..end).contains(&handle))
+            else {
+                continue;
+            };
+            // SAFETY: registered heaps stay alive until `Heap::drop`, which
+            // takes the `SHADER_HEAPS` lock held here.
+            let heap = unsafe { &*(at as *const Heap) };
+            let Some(index) = heap.index(handle) else {
                 continue;
             };
             let same = match view(handle) {
