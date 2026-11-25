@@ -505,7 +505,15 @@ impl Shader {
         // The clean-up, before anything is declared about the code: a
         // feature whose last use it removed must not be declared (the
         // validator compares the flags with what the code uses).
-        let passes = super::shader_opt() & super::bitcode::opt::MODULE;
+        let mut passes = super::shader_opt() & super::bitcode::opt::MODULE;
+        // Compute programs go without [`REUSE`](super::bitcode::opt::REUSE)
+        // (fxceless/victory-fork#195): AMD's driver (amdxc64.dll) crashes
+        // in `CreateComputePipelineState` on some of them after that pass,
+        // the ray-traced lighting resolves among them, and builds them all
+        // without it. `VICTORY_REUSE_ALL=1` runs it on them as before.
+        if self.threads.is_some() && self.mesh.is_none() && !super::reuse_all() {
+            passes &= !super::bitcode::opt::REUSE;
+        }
         if passes != 0 {
             self.m.optimise(passes);
             let used = self.m.usage();

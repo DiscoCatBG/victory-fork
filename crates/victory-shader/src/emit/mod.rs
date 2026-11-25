@@ -191,6 +191,18 @@ pub fn shader_opt() -> u32 {
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
 
+/// `VICTORY_REUSE_ALL=1`: compute programs get the pass that keeps one
+/// instruction for one value too (`bitcode::opt::REUSE`). Off, they go
+/// without it: AMD's driver crashes making the pipeline of some of them
+/// after it (`shader::Builder::finish`).
+///
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does).
+pub fn reuse_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REUSE_ALL").is_some_and(|v| v == "1"))
+}
+
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
 /// unreadable. Pure, for testing.
 fn parse_shader_opt(value: Option<&str>) -> u32 {
