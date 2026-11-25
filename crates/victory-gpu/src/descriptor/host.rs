@@ -699,6 +699,26 @@ fn dynamic_uncapped() -> u32 {
     })
 }
 
+thread_local! {
+    /// This thread is in the pass over the heap's buffer views ([`passing`]).
+    static PASSING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Until the value returned is dropped, this thread's [`HostHeap::mirror`]
+/// calls are the looks of the pass over the heap's buffer views
+/// (`crate::draw`'s `heap_buffers_ready`): the slots they make are not
+/// marked as changed for the next pass.
+pub(crate) fn passing() -> impl Drop {
+    struct Passing;
+    impl Drop for Passing {
+        fn drop(&mut self) {
+            PASSING.with(|p| p.set(false));
+        }
+    }
+    PASSING.with(|p| p.set(true));
+    Passing
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -1212,7 +1232,9 @@ impl HostHeap {
     }
 
     /// The title slots whose buffer view was written, or went, since the
-    /// last call.
+    /// last call. Not those the caller's own looks made or found gone
+    /// while [`passing`]: a write of the title after such a look marks the
+    /// slot as any other (and changes its record, which the pass compares).
     pub(crate) fn buffer_changes(&self) -> Vec<u32> {
         let mut changed = self.changed.lock().unwrap_or_else(|e| e.into_inner());
         std::mem::take(&mut *changed).into_iter().collect()
@@ -1309,7 +1331,11 @@ impl HostHeap {
         } else {
             buffers.remove(&index)
         };
-        if was {
+        // Not when the pass over the heap's buffer views makes the slot
+        // itself ([`passing`]): it has the slot in hand, and a mark here
+        // had it look at the slot again next pass, for nothing (every
+        // written slot was looked at in two passes).
+        if was && !PASSING.with(std::cell::Cell::get) {
             self.changed
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

@@ -1674,6 +1674,8 @@ impl State {
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+        // The slots the looks below make are not marked for the next pass.
+        let passing = crate::descriptor::host::passing();
         for (n, &index) in slots.iter().enumerate() {
             ranges.forget(index);
             let Some(handle) = heap.handle(index) else {
@@ -1719,6 +1721,7 @@ impl State {
             let key = std::sync::Arc::as_ptr(&shadow) as usize;
             ranges.keep(index, key, &shadow, [address, address + len], record, entry, unordered);
         }
+        drop(passing);
         let views = ranges.views() as u32;
         let looked = started.elapsed();
         // Per host copy, the span its picked views cover.
