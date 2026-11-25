@@ -168,6 +168,29 @@ fn card_limits() -> (u64, u64) {
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// The card's memory still kept for copies of title buffers
+/// (`VICTORY_CARD_RESERVE=1`; off by default): the most `card_limits`
+/// allows, less what the copies alive take. A buffer gets its card copy
+/// the first time it is used, and never later: once the textures picked
+/// by index had filled the card to its share (`resource::room`), every big
+/// buffer first used after that stayed in the PC's memory, and what
+/// shaders wrote to it was looked for on the CPU (600-780 MB a frame
+/// against 24 with the copies on the card, frames twice as long). With the
+/// switch the textures leave this much of the card free
+/// (`resource::room`), and a copy may take the card up to the textures'
+/// share rather than four fifths of it ([`card_for`]).
+pub(crate) fn card_reserve() -> u64 {
+    if !cards() || !card_reserve_on() {
+        return 0;
+    }
+    card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed))
+}
+
+fn card_reserve_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_RESERVE").is_some_and(|v| v == "1"))
+}
+
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
@@ -258,8 +281,11 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     // queue's own rule (`resource::room`: nine tenths of the budget) counts
     // them, so the card's use stays where it was and the textures' share
     // shrinks by the copies' bytes, at most `card_limits`' second number.
+    // With the reserve the textures left room for the copies: up to the
+    // textures' own share of the budget.
+    let share = if card_reserve_on() { crate::resource::room_share() } else { 80 };
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * share
     {
         return None;
     }
