@@ -1797,9 +1797,9 @@ struct Deferred {
     kept: Vec<windows::core::IUnknown>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
-    refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    refreshed: crate::fx::Set<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: crate::fx::Set<usize>,
     /// Title-written textures whose staging buffer is copied into the host
     /// texture in this list's prelude if refreshed or not uploaded yet.
     texture_uploads: Vec<(
@@ -2059,8 +2059,8 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
 /// parts of the same 64 KiB piece; the compare hashes the whole piece for
 /// each and stores the hashes, so the second of them may find them stored
 /// already and not flag them.
-fn flagged_parts(flags: &[(usize, u32, u32)]) -> std::collections::HashMap<(usize, u32), u32> {
-    let mut parts = std::collections::HashMap::new();
+fn flagged_parts(flags: &[(usize, u32, u32)]) -> crate::fx::Map<(usize, u32), u32> {
+    let mut parts = crate::fx::Map::default();
     for &(copy, piece, mask) in flags.iter().filter(|f| f.2 != 0) {
         *parts.entry((copy, piece)).or_insert(0) |= mask;
     }
@@ -4492,7 +4492,7 @@ impl Host {
         let (differs, pushed, push) = {
             let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             let differs = work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize));
-            let mut pushed: Vec<std::collections::HashMap<u32, u32>> = vec![Default::default(); plans.len()];
+            let mut pushed: Vec<crate::fx::Map<u32, u32>> = vec![Default::default(); plans.len()];
             let mut push_at = None;
             if let Some(push) = work.as_mut().and_then(|w| w.push.as_mut()) {
                 let meta = push.meta.1;
@@ -4533,7 +4533,7 @@ impl Host {
             // plans have run, and their dwords are given to no other plan
             // before these are done with (`card_done`).
             let differs = unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) };
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = crate::fx::Set::default();
             // The parts that went down with each plan's own pass: (range,
             // offsets in the copy, where they lie in the slots' mapping).
             let mut parts: Vec<Vec<(usize, usize, usize, usize)>> = vec![Vec::new(); plans.len()];
@@ -4570,7 +4570,7 @@ impl Host {
             // too (unless it wrote them over), as a fetch after all of them
             // did. Run C's flights rewrote the same parts again and again:
             // merged from every plan, they were 294 MB a frame.
-            let mut last: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
+            let mut last: crate::fx::Map<(usize, usize, usize), usize> = crate::fx::Map::default();
             for (n, (plan, parts)) in plans.iter().zip(&parts).enumerate().rev() {
                 for &(i, lo, hi, _) in parts {
                     last.entry((std::sync::Arc::as_ptr(&plan.ranges[i].shadow) as usize, lo, hi)).or_insert(n);
@@ -4580,7 +4580,7 @@ impl Host {
                 // Merged from their slots, as they were when the plan's lists
                 // had run (behind its own send of title bytes, ahead of later
                 // ones); a part a later plan pushed is left to that plan.
-                let mut merged = std::collections::HashSet::new();
+                let mut merged = crate::fx::Set::default();
                 if let Some((_, sent_as)) = plan.push {
                     // Parts that touch are merged as one run: they lie in
                     // the same pieces, and a run is one title memory read
@@ -6967,9 +6967,9 @@ struct Batch {
     /// the heap's buffers ready adds some 4,100 copies, and searching them
     /// for every refresh of a submission was tens of millions of
     /// comparisons a frame.
-    index: std::collections::HashMap<usize, usize>,
+    index: crate::fx::Map<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
-    textures: std::collections::HashSet<usize>,
+    textures: crate::fx::Set<usize>,
 }
 
 impl Batch {

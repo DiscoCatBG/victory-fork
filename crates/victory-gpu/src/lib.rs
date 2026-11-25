@@ -34,6 +34,8 @@ mod heap_pass;
 #[cfg(windows)]
 mod heap_marks;
 #[cfg(windows)]
+mod fx;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
