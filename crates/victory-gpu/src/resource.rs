@@ -1473,9 +1473,35 @@ pub(crate) fn room() -> bool {
     match crate::host::host().and_then(|h| h.video_memory()) {
         // (less what is kept for copies of title buffers not made yet,
         // `shadow::card_reserve`)
-        Some([budget, used, ..]) => under_share(budget, used, crate::shadow::card_reserve(), room_percent()),
+        Some([budget, used, shared_budget, shared_used]) => {
+            let reserve = crate::shadow::card_reserve();
+            under_share(budget, used, reserve, room_percent())
+                || texture_spill() && spill_room(budget, used, reserve, room_percent(), shared_budget, shared_used)
+        }
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+/// Whether textures picked by index may go on, once the card's share
+/// ([`room_percent`]) is reached, into the PC's memory the system shares
+/// with the card (on by default; `VICTORY_TEXTURE_SPILL=0` keeps them to
+/// the card's share, as before). fxfork #601 (DiogoPCastelos): on a 6 GB
+/// card (RTX 3060 Laptop) the card's share was reached in the world's
+/// first frames and the textures still waiting (skin, walls, clothes) were
+/// sampled empty, black in the G-buffer's albedo; with the shared memory
+/// taken too the same shots had their faces and walls. A texture there is
+/// read over the bus: slower, not missing.
+#[cfg(windows)]
+fn texture_spill() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SPILL").is_none_or(|v| v != "0"))
+}
+
+/// [`texture_spill`]'s rule: what the card and the shared memory hold
+/// together (the card's use with `reserve` counted as used) stays under the
+/// card's share plus half the shared budget; the other half is the title's.
+fn spill_room(budget: u64, used: u64, reserve: u64, percent: u64, shared_budget: u64, shared_used: u64) -> bool {
+    used.saturating_add(reserve).saturating_add(shared_used) < (budget / 100 * percent).saturating_add(shared_budget / 2)
 }
 
 /// Whether the card's memory in use, with `reserve` bytes kept for copies
@@ -2846,6 +2872,22 @@ mod tests {
         assert!(super::under_share(budget, 8_500 * MB, 0, 90));
         // No overflow at the edges.
         assert!(!super::under_share(budget, u64::MAX, u64::MAX, 90));
+    }
+
+    /// Past the card's share, textures may take up to half of the shared
+    /// budget (fxfork #601), the reserve still counted as used.
+    #[test]
+    fn textures_spill_into_half_the_shared_memory() {
+        const MB: u64 = 1 << 20;
+        let (budget, shared) = (6_000 * MB, 8_000 * MB);
+        // The card's 90% (5,400 MB) reached, nothing shared in use: room.
+        assert!(super::spill_room(budget, 5_600 * MB, 0, 90, shared, 0));
+        // Card share plus half the shared budget (9,400 MB) reached: none.
+        assert!(!super::spill_room(budget, 5_600 * MB, 0, 90, shared, 3_800 * MB));
+        assert!(super::spill_room(budget, 5_600 * MB, 0, 90, shared, 3_700 * MB));
+        // The reserve for card copies counts as used.
+        assert!(!super::spill_room(budget, 5_600 * MB, 200 * MB, 90, shared, 3_700 * MB));
+        assert!(!super::spill_room(budget, u64::MAX, u64::MAX, 90, u64::MAX, u64::MAX));
     }
 
     use super::*;
