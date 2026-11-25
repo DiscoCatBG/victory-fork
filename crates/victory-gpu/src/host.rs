@@ -7834,10 +7834,18 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     if len == 0 {
         return true;
     }
-    if len >= (256 << 10) && mapped_whole(src as usize, len, false) {
-        // SAFETY: every page of both ranges is committed and readable or
-        // writable (`mapped_whole`); `dst` is ours and writable.
-        unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+    // The answer is only a hint: another thread may remap or decommit the
+    // pages between the question and the copy (the title's own frees, our
+    // splits and remaps of its views). A plain memcpy then faulted on a
+    // reserved page; the copy is ours that reports a fault instead
+    // ([`crate::title_copy`]), and the kernel's copy below takes over.
+    // (Trexies cd41200 dropped this path for the race; this keeps its speed.)
+    if len >= (256 << 10)
+        && mapped_whole(src as usize, len, false)
+        // SAFETY: `dst` is `len` bytes the caller may write; a fault on
+        // either range returns false.
+        && unsafe { crate::title_copy::copy(dst, src, len) }
+    {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::MoveFast, len as u64);
         return true;
@@ -7933,19 +7941,30 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     let mut at = dst as usize;
     let end = at + len;
     while at < end {
-        if let Some(to) = mapped_run(at, end, true) {
-            // SAFETY: the destination's pages are committed and writable
-            // (`mapped_run`), the source is our host copy.
-            unsafe {
-                std::ptr::copy_nonoverlapping(src.wrapping_add(at - dst as usize), at as *mut u8, to - at)
-            };
+        let run = mapped_run(at, end, true);
+        // `mapped_run`'s answer is only a hint: the title (or our own split
+        // and remap of its views) may unmap or decommit the pages before the
+        // copy. A plain memcpy then faulted on a reserved page and took the
+        // process down; ours reports the fault ([`crate::title_copy`]) and
+        // the run goes to the kernel below, which writes what is there.
+        if let Some(to) = run
+            // SAFETY: the source is our host copy of `len` bytes, the
+            // destination title memory; a fault on either returns false.
+            && unsafe {
+                crate::title_copy::copy(at as *mut u8, src.wrapping_add(at - dst as usize), to - at)
+            }
+        {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::MoveFast, (to - at) as u64);
             at = to;
             continue;
         }
         let step = 64 << 10;
-        let to = ((at / step + 1) * step).min(end);
+        let to = match run {
+            // the run changed under us: the kernel, a 64 KiB piece at a time
+            Some(r) => ((at / step + 1) * step).min(r),
+            None => ((at / step + 1) * step).min(end),
+        };
         if !write(at, to - at) {
             for_pieces(at, to - at, 4 << 10, |at, n| {
                 write(at, n);

@@ -1456,8 +1456,21 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
             {
-                // SAFETY: both ranges are committed title memory.
-                unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
+                let (s, d) = (src as usize, dst as usize);
+                if s.saturating_add(len) <= d || d.saturating_add(len) <= s {
+                    // The answer above is only a hint: the title may unmap
+                    // either range before the copy (a plain memcpy then
+                    // faulted). Ours reports a fault, and the kernel's copy
+                    // writes what is still there.
+                    // SAFETY: `dst` is title memory the title gave the GPU
+                    // to write; a fault on either range returns false.
+                    if !unsafe { crate::title_copy::copy(dst as *mut u8, src as *const u8, len) } {
+                        crate::host::copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    }
+                } else {
+                    // SAFETY: both ranges are committed title memory.
+                    unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
+                }
             }
         });
     }
