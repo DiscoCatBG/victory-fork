@@ -2414,8 +2414,20 @@ fn late_blocked(runs: &[&HostList], forwarded: &[(usize, usize, usize)]) -> Opti
 /// writing copy's buffer holds what title memory will hold once the flight
 /// is copied back. Anywhere else (the title wrote there since, a
 /// read-back, bottom-of-pipe writes, two writers, the refreshing copy's
-/// own shaders writing there too, a copy in the card's memory or in
-/// place), it waits as before.
+/// own shaders writing there too, in a flight or in this submission, a copy
+/// in the card's memory or in place), it waits as before.
+///
+/// The copy runs in queue order; what the CPU puts into the refreshing
+/// copy does not, it is there at once. So from the moment a range is
+/// planned until the card has passed its copy ([`Handed`]) the CPU puts
+/// nothing into that range of the refreshing copy (`Shadow::hand`): a page
+/// the title wrote beside the range would else go over the bytes of an
+/// earlier copy that lists still queued read, and bytes refreshed after
+/// the flight landed would end up under a copy still queued, with the
+/// page noted as taken. A later refresh of the range in that time takes
+/// the bytes on the card again, or needs nothing where the writing copy
+/// still holds what title memory holds, or waits for the card
+/// ([`handed_blocks`]).
 pub(crate) fn alias_forward() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_FORWARD").is_none_or(|v| v != "0"))
@@ -2433,8 +2445,143 @@ struct Forward {
 
 /// Since the last frame-rate line, of [`alias_forward`]: refreshes that
 /// took bytes on the card instead of waiting, ranges copied, their bytes,
-/// and refreshes that waited because the check refused them.
-static FORWARD_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// refreshes that waited because the check refused them, and submissions
+/// that waited for the card to pass a copy still queued ([`handed_blocks`]).
+static FORWARD_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// A [`Forward`] the card may not have passed yet: `done` is the fence
+/// value signalled behind the submission it was sent ahead of. Until then
+/// the CPU leaves `[address, end)` of `to` alone (`Shadow::hand`).
+struct Handed {
+    to: std::sync::Arc<crate::shadow::Shadow>,
+    from: std::sync::Arc<crate::shadow::Shadow>,
+    address: usize,
+    end: usize,
+    done: u64,
+}
+
+/// The copies between host copies the card may not have passed
+/// ([`Handed`]). Changed by the submitting thread, under the submission
+/// lock.
+static HANDED: Mutex<Vec<Handed>> = Mutex::new(Vec::new());
+
+/// Gives each of `copies` the ranges `handed` still holds for it.
+fn handed_set(handed: &[Handed], copies: &[std::sync::Arc<crate::shadow::Shadow>]) {
+    use std::sync::Arc;
+    for (i, copy) in copies.iter().enumerate() {
+        if copies[..i].iter().any(|c| Arc::ptr_eq(c, copy)) {
+            continue;
+        }
+        copy.hand(handed.iter().filter(|h| Arc::ptr_eq(&h.to, copy)).map(|h| (h.address, h.end)).collect());
+    }
+}
+
+/// Forgets the copies between host copies that `gone` names (those the
+/// card has passed, or that were never sent): the CPU refreshes their
+/// ranges again.
+fn handed_drop(gone: impl Fn(&Handed) -> bool) {
+    let mut handed = HANDED.lock().unwrap_or_else(|e| e.into_inner());
+    if !handed.iter().any(&gone) {
+        return;
+    }
+    let copies: Vec<_> = handed.iter().filter(|h| gone(h)).map(|h| h.to.clone()).collect();
+    handed.retain(|h| !gone(h));
+    handed_set(&handed, &copies);
+}
+
+/// Notes `forwards` as on their way, sent ahead of the submission whose
+/// fence value is `done`: from here the CPU leaves their ranges of the
+/// refreshing copies alone.
+fn hand(forwards: &[Forward], done: u64) {
+    use std::sync::Arc;
+    if forwards.is_empty() {
+        return;
+    }
+    let mut handed = HANDED.lock().unwrap_or_else(|e| e.into_inner());
+    for f in forwards {
+        // The bytes change on the card: a kept snapshot is not current.
+        f.to.taking(f.address, f.end);
+        match handed.iter_mut().find(|h| Arc::ptr_eq(&h.to, &f.to) && h.address == f.address && h.end == f.end) {
+            Some(h) => (h.from, h.done) = (f.from.clone(), done),
+            None => handed.push(Handed {
+                to: f.to.clone(),
+                from: f.from.clone(),
+                address: f.address,
+                end: f.end,
+                done,
+            }),
+        }
+    }
+    let copies: Vec<_> = forwards.iter().map(|f| f.to.clone()).collect();
+    handed_set(&handed, &copies);
+}
+
+/// `[from, to)` without the `covered` ranges.
+fn uncovered(from: usize, to: usize, covered: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut covered: Vec<(usize, usize)> = covered.iter().copied().filter(|&(a, b)| a < to && b > from).collect();
+    covered.sort_unstable();
+    let (mut at, mut left) = (from, Vec::new());
+    for (a, b) in covered {
+        if a > at {
+            left.push((at, a));
+        }
+        at = at.max(b);
+    }
+    if at < to {
+        left.push((at, to));
+    }
+    left
+}
+
+/// Whether `runs` need the card to pass a copy between host copies that is
+/// still queued ([`Handed`]) before they are prepared. The CPU leaves such
+/// a range of the refreshing copy alone, so:
+///
+/// - a refresh of it is in order where this submission takes the bytes on
+///   the card again (`forwards`), or where the writing copy holds what
+///   title memory holds now (the queued copy brings exactly that; no
+///   flight writes there any more, or the refresh would have waited or be
+///   in `forwards`). Anywhere else the title wrote there since, and its
+///   bytes can only go in once the card has passed the copy;
+/// - a range given to this submission's shaders needs its snapshot taken
+///   from the bytes the copy brings, which are not there before it ran.
+fn handed_blocks(runs: &[&HostList], forwards: &[Forward]) -> bool {
+    use std::sync::Arc;
+    let handed = HANDED.lock().unwrap_or_else(|e| e.into_inner());
+    if handed.is_empty() {
+        return false;
+    }
+    let mut checked = 0usize;
+    for list in runs {
+        for step in &list.deferred().copies {
+            match step {
+                Step::Refresh(shadow, address, len) => {
+                    let (from, to) = (*address, *address + *len);
+                    let mut again: Option<Vec<(usize, usize)>> = None;
+                    for h in handed.iter().filter(|h| Arc::ptr_eq(&h.to, shadow) && h.address < to && h.end > from) {
+                        let again = again.get_or_insert_with(|| {
+                            forwards.iter().filter(|f| Arc::ptr_eq(&f.to, shadow)).map(|f| (f.address, f.end)).collect()
+                        });
+                        for (a, b) in uncovered(h.address.max(from), h.end.min(to), again) {
+                            checked += b - a;
+                            if checked > FORWARD_CHECK_MOST || !h.from.holds_title(a, b) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                Step::GpuWrite(shadow, address, len) => {
+                    let (from, to) = (*address, *address + *len);
+                    if handed.iter().any(|h| Arc::ptr_eq(&h.to, shadow) && h.address < to && h.end > from) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
 
 /// The most bytes of title memory a submission compares with snapshots to
 /// forward ([`alias_forward`]); past it, the rest waits.
@@ -2468,6 +2615,17 @@ fn plan_forwards(runs: &[&HostList]) -> (Vec<Forward>, Vec<(usize, usize, usize)
         }
         (line.written.clone(), line.by_copy.clone(), line.immed_writes(), owners)
     };
+    // What this submission gives to shaders (copy, from, to): the snapshot
+    // of such a range is taken on the CPU before the lists go, when a copy
+    // on the card has not brought its bytes yet.
+    let mut given: Vec<(usize, usize, usize)> = Vec::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::GpuWrite(shadow, address, len) = step {
+                given.push((Arc::as_ptr(shadow) as usize, *address, *address + *len));
+            }
+        }
+    }
     let mut checked = 0usize;
     for list in runs {
         for step in &list.deferred().copies {
@@ -2486,8 +2644,10 @@ fn plan_forwards(runs: &[&HostList]) -> (Vec<Forward>, Vec<(usize, usize, usize)
                 || !to.plain()
                 // A read-back, or two writers.
                 || others.iter().any(|&(o, ..)| o == 0 || o != owner)
-                // The refreshing copy's own shaders write there too.
-                || by_copy.iter().any(|&(o, a, b)| o == copy && others.iter().any(|&(_, x, y)| x < b && y > a));
+                // The refreshing copy's own shaders write there too, in a
+                // flight or in this submission.
+                || by_copy.iter().any(|&(o, a, b)| o == copy && others.iter().any(|&(_, x, y)| x < b && y > a))
+                || given.iter().any(|&(o, a, b)| o == copy && others.iter().any(|&(_, x, y)| x < b && y > a));
             let writer = owners.iter().find(|s| Arc::as_ptr(s) as usize == owner);
             let pieces: Vec<(usize, usize)> = others.iter().map(|&(_, a, b)| (a.max(from), b.min(end))).collect();
             let bytes: usize = pieces.iter().map(|&(a, b)| b - a).sum();
@@ -2990,12 +3150,14 @@ fn late_line(frames: f64) {
         let f: Vec<f64> = FORWARD_STATS.iter().map(|f| f.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
             "refreshes over another copy's in-flight shader writes, per frame: {:.1} took the bytes on the card ({:.1} ranges, {:.1} MB) \
-             instead of waiting, {:.1} waited (title wrote there since, no snapshot, a read-back, two writers, or a copy not plain; \
-             VICTORY_ALIAS_FORWARD=0: all wait)",
+             instead of waiting, {:.1} waited (title wrote there since, no snapshot, a read-back, two writers, the copy's own \
+             shaders write there, or a copy not plain), {:.1} submissions waited for the card to pass such a copy still queued \
+             (VICTORY_ALIAS_FORWARD=0: all wait)",
             f[0],
             f[1],
             f[2] / 1048576.0,
             f[3],
+            f[4],
         );
     }
     {
@@ -3099,6 +3261,76 @@ mod forward_tests {
             assert_eq!(byte, want, "byte {i}");
         }
         drop(title);
+    }
+
+    /// While a copy between host copies is queued on the card
+    /// (`Shadow::hand`), a refresh puts nothing into its range of the
+    /// refreshing copy, to the byte, and does not note its pages as taken:
+    /// once the card has passed it, the title's bytes go in. And the
+    /// writing copy holds title memory only where its bytes are the
+    /// title's.
+    #[test]
+    fn a_refresh_leaves_a_range_alone_while_its_copy_is_queued() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const PAGE: usize = crate::watch::PAGE;
+        const LEN: usize = 3 * PAGE;
+        let Some(host) = host() else {
+            eprintln!("no host GPU; skipped");
+            return;
+        };
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) }.cast::<u8>();
+        assert!(!title.is_null());
+        let start = title as usize;
+        let (a_buffer, a_data) = host.shared_buffer(LEN as u64).expect("a buffer");
+        let (b_buffer, b_data) = host.shared_buffer(LEN as u64).expect("a buffer");
+        // The queued copy's range: inside the middle page, not all of it.
+        let (from, to) = (PAGE + 100, 2 * PAGE - 100);
+        // SAFETY: the allocation and the mappings hold LEN bytes.
+        unsafe {
+            for i in 0..LEN {
+                *title.add(i) = (i % 7) as u8 + 1;
+                *a_data.add(i) = (i % 7) as u8 + 1;
+            }
+            // The writing copy differs from title memory in one byte of
+            // the range.
+            *a_data.add(from + 50) ^= 0x80;
+            std::ptr::write_bytes(b_data, 0xEE, LEN);
+        }
+        let a = crate::shadow::Shadow::for_test(a_buffer, a_data, start as u64, LEN as u64, None);
+        let b = crate::shadow::Shadow::for_test(b_buffer, b_data, start as u64, LEN as u64, None);
+        b.hand(vec![(start + from, start + to)]);
+        b.update(start, LEN);
+        for (i, &byte) in b.bytes_for_test().iter().enumerate() {
+            let want = if (from..to).contains(&i) { 0xEE } else { (i % 7) as u8 + 1 };
+            assert_eq!(byte, want, "byte {i} with the copy queued");
+        }
+        assert!(!a.holds_title(start + from, start + to));
+        assert!(a.holds_title(start + from + 51, start + to));
+        // SAFETY: inside the mapping.
+        unsafe { *a_data.add(from + 50) ^= 0x80 };
+        assert!(a.holds_title(start + from, start + to));
+        assert!(!a.holds_title(start + from, start + LEN + 1));
+        // The card has passed the copy.
+        b.hand(Vec::new());
+        b.update(start, LEN);
+        for (i, &byte) in b.bytes_for_test().iter().enumerate() {
+            assert_eq!(byte, (i % 7) as u8 + 1, "byte {i} with the copy passed");
+        }
+        drop((a, b));
+        // SAFETY: the allocation above; nothing names it any more.
+        unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn uncovered_is_the_range_without_what_covers_it() {
+        use super::uncovered;
+        assert_eq!(uncovered(10, 20, &[]), [(10, 20)]);
+        assert_eq!(uncovered(10, 20, &[(0, 30)]), []);
+        assert_eq!(uncovered(10, 20, &[(12, 14), (0, 11), (18, 40)]), [(11, 12), (14, 18)]);
+        assert_eq!(uncovered(10, 20, &[(20, 30), (0, 10)]), [(10, 20)]);
+        assert_eq!(uncovered(10, 20, &[(13, 15), (14, 16)]), [(10, 13), (16, 20)]);
     }
 }
 
@@ -3418,7 +3650,14 @@ impl Host {
         list
     }
 
-    /// An allocator and a closed list for a prelude.
+    /// Forgets the copies between host copies the card has passed
+    /// ([`Handed`]).
+    fn handed_passed(&self) {
+        // SAFETY: a plain query.
+        let passed = unsafe { self.fence.GetCompletedValue() };
+        handed_drop(|h| h.done <= passed);
+    }
+
     /// Records and sends the copies of [`alias_forward`]: each range from
     /// the writing copy's buffer into the refreshing copy's, on the card, in
     /// a list of its own sent now (behind the flights whose shaders wrote
@@ -3479,6 +3718,7 @@ impl Host {
         true
     }
 
+    /// An allocator and a closed list for a prelude.
     fn make_prelude(&self) -> Option<Prelude> {
         // SAFETY: plain object creation.
         let made: windows::core::Result<Prelude> = unsafe {
@@ -4884,6 +5124,16 @@ impl Host {
                 forwards.clear();
             }
         }
+        // The copies between host copies the card has passed are forgotten;
+        // one still queued that these lists cannot be prepared around is
+        // waited for ([`handed_blocks`]).
+        self.handed_passed();
+        if late && handed_blocks(runs, &forwards) {
+            FORWARD_STATS[4].fetch_add(1, Ordering::Relaxed);
+            self.settle(&mut submitted, WHY_READ);
+            forwards.clear();
+            self.handed_passed();
+        }
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -4897,6 +5147,9 @@ impl Host {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
             self.settle(&mut submitted, WHY_SYNC);
+            // All landed: the refreshes take title memory.
+            forwards.clear();
+            self.handed_passed();
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
@@ -4946,13 +5199,21 @@ impl Host {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
+                forwards.clear();
+                self.handed_passed();
                 crate::watch::ask_once(&ranges);
             }
         } else if behind && stale_under_flights(runs) {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
+            forwards.clear();
+            self.handed_passed();
         }
+        // From here the CPU leaves the ranges alone that take their bytes on
+        // the card, until the card has passed the copies (sent below, ahead
+        // of this submission's lists).
+        hand(&forwards, *submitted + 1);
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -4997,6 +5258,10 @@ impl Host {
             for f in &forwards {
                 f.to.take_from(&f.from, f.address, f.end);
             }
+            // Nothing is queued: the ranges are the CPU's again.
+            let never = *submitted + 1;
+            handed_drop(|h| h.done == never);
+            self.handed_passed();
             settled += settling.elapsed();
         }
         let prepared = std::time::Instant::now();

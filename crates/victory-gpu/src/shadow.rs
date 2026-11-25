@@ -40,6 +40,13 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// Ranges of title memory that a copy still queued on the card fills
+    /// from another host copy's buffer (`crate::host::alias_forward`). Until
+    /// the card has passed that copy the CPU puts nothing there: bytes it
+    /// wrote now would be under the queued copy when it runs, and those it
+    /// wrote over an earlier one would be read by the lists sent behind
+    /// that one. Set by the submitting thread ([`Shadow::hand`]).
+    handed: Mutex<Vec<(usize, usize)>>,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -2066,6 +2073,41 @@ impl Shadow {
         }
     }
 
+    /// The ranges of title memory the CPU leaves alone in this copy from
+    /// now on (`crate::host::alias_forward`): those a copy queued on the
+    /// card fills from another copy's buffer and the card has not passed
+    /// yet. All of them each time; none once the card has passed them all.
+    pub(crate) fn hand(&self, ranges: Vec<(usize, usize)>) {
+        *self.handed.lock().unwrap_or_else(|e| e.into_inner()) = ranges;
+    }
+
+    /// Title range `[address, end)` of this copy is about to be filled on
+    /// the card from another copy's buffer: a kept snapshot is not current
+    /// there any more.
+    pub(crate) fn taking(&self, address: usize, end: usize) {
+        let (from, to) = self.inside(address, end.saturating_sub(address));
+        self.changed(from, to);
+    }
+
+    /// Whether this plain copy's bytes over title range `[address, end)`
+    /// are what title memory holds there now. For a range no flight's
+    /// shaders are writing (the card is not changing the bytes); false
+    /// outside the copy or where title memory cannot be read.
+    pub(crate) fn holds_title(&self, address: usize, end: usize) -> bool {
+        let start = self.start as usize;
+        if !self.plain() || address >= end || address < start || end > start + self.len as usize {
+            return false;
+        }
+        let mut now = vec![0u8; end - address];
+        if !crate::host::read_into(address as *const u8, &mut now) {
+            return false;
+        }
+        // SAFETY: inside the mapping, which holds `len` bytes while the copy
+        // lives.
+        let held = unsafe { std::slice::from_raw_parts(self.data.add(address - start), end - address) };
+        now == held
+    }
+
     /// The offset of a title address in the copy, if it lies in it.
     pub(crate) fn offset_in(&self, address: u64) -> Option<u64> {
         address.checked_sub(self.start).filter(|&at| at < self.len)
@@ -2129,6 +2171,7 @@ impl Shadow {
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            handed: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
             kept: Mutex::default(),
@@ -2757,6 +2800,13 @@ impl Shadow {
             .copied()
             .filter(|&(a, e)| a < to && e > from)
             .collect();
+        // And what a copy queued on the card fills from another copy's
+        // buffer: left alone like a range shaders are writing, its pages not
+        // noted as copied, so the title's bytes are taken once the card has
+        // passed the copy.
+        busy.extend(
+            self.handed.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|&(a, e)| a < to && e > from),
+        );
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
